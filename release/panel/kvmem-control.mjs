@@ -71,6 +71,19 @@ const HIPFIRE_BAT        = path.join(HIPFIRE_ROOT, 'hipfire.bat');
 // 和 HIPFIRE_ROOT 一个道理：写死本机路径的发行包，别人拿到只能看到一个扫不出
 // 任何东西的按钮。
 const HIPFIRE_MODELS_DIR = process.env.KVMEM_HIPFIRE_MODELS_DIR || 'J:\\hipfiremodels';
+// 模型实际会被搬到别处 —— 2026-10-25 的真机现场：`J:\\hipfiremodels` 被清空，
+// 全部 .hfq/.gguf 挪进了发行包目录下的 `models\`，于是「扫描模型」什么都扫不到、
+// 切回 hipfire 直接报「主模型不存在」。扫描与自动挑选因此改成多目录，按顺序合并去重。
+// 环境变量 `KVMEM_HIPFIRE_MODELS_DIR` 指定时**只**用它（显式覆盖优先）。
+const HIPFIRE_MODELS_DIRS = process.env.KVMEM_HIPFIRE_MODELS_DIR
+  ? [process.env.KVMEM_HIPFIRE_MODELS_DIR]
+  : [
+      'J:\\hipfiremodels',
+      'J:\\hipfire-kvmem-2.0.0-windows-gfx1100\\hipfire-kvmem-2.0.0\\models',
+      'J:\\kvmemmodels',
+      'G:\\models',
+      path.join(ROOT, 'models'),
+    ].filter((d, i, a) => a.indexOf(d) === i);
 // hipfire 的 serve.port 环境变量是 HIPFIRE_PORT（不是 HIPFIRE_SERVE_PORT）。
 const HIPFIRE_PORT_ENV   = 'HIPFIRE_PORT';
 // memory.kv_cache 的合法值（逐字抄自 hipfire 的报错 Enum，不是 llama.cpp 的 dtype）。
@@ -909,16 +922,22 @@ const HF_MODEL_SLOT_INCOMPATIBLE = /\.mq\d+-pro(?!-)/i;
 
 // `dir` 是为了可测：默认走真实目录，测试可以塞一个临时目录进来，从而真的验证
 // "有 pro 也有 xt 时会挑哪个"，而不是只测正则本身（那只证明正则对，不证明选对了）。
-function pickHf(re, avoid = null, dir = HIPFIRE_MODELS_DIR) {
-  try {
-    if (!fs.existsSync(dir)) return '';
-    const names = fs.readdirSync(dir).filter((n) => re.test(n)).sort();
-    if (!names.length) return '';
-    // `avoid` 只改变**优先级**，不是判据：即使全都命中也要返回一个，让后置检查
-    // 去报明确的错。返回空串的症状是"模型框是空的"，比"选了个过不了门的"更难查。
-    const ok = names.filter((n) => !(avoid && avoid.test(n)));
-    return path.join(dir, (ok.length ? ok : names)[0]);
-  } catch { return ''; }
+function pickHf(re, avoid = null, dir = null) {
+  // `dir` 给定时只搜那一个（测试用）；否则按 HIPFIRE_MODELS_DIRS 的顺序找第一个命中的
+  // 目录 —— 模型被搬走时自动挑选仍能落到实际存在的那份。
+  const dirs = dir ? [dir] : HIPFIRE_MODELS_DIRS;
+  for (const d of dirs) {
+    try {
+      if (!fs.existsSync(d)) continue;
+      const names = fs.readdirSync(d).filter((n) => re.test(n)).sort();
+      if (!names.length) continue;
+      // `avoid` 只改变**优先级**，不是判据：即使全都命中也要返回一个，让后置检查
+      // 去报明确的错。返回空串的症状是"模型框是空的"，比"选了个过不了门的"更难查。
+      const ok = names.filter((n) => !(avoid && avoid.test(n)));
+      return path.join(d, (ok.length ? ok : names)[0]);
+    } catch {}
+  }
+  return '';
 }
 
 function defaultConfig() {
@@ -2242,6 +2261,20 @@ function enginePrecheck(cfg) {
     return null;
   }
   if (!fs.existsSync(SERVER_EXE)) return '未找到服务程序：' + SERVER_EXE;
+  // ── llama 侧的模型校验（2026-10-25）────────────────────────────────────
+  //
+  // 原来这里只查服务程序、不查模型：配置里的 `model` 指向一个不存在的路径时，
+  // 面板照样放行，然后 spawn 出去的服务在启动阶段退码，控制台只看到一句笼统的
+  // 报错。真机现场：`model` 还指着 `H:\dshworkspace\KVMem\models\…gguf`
+  // （该目录早已不存在，模型实际在 `G:\models\…`），于是"切换成 llama 引擎"
+  // 每次都失败。这里提前拦下并说清缺的是哪个文件。
+  if (!cfg.model) return 'llama 引擎需要选择主模型（.gguf）';
+  if (!fs.existsSync(String(cfg.model))) {
+    return `llama 主模型不存在：${cfg.model}（配置里的路径过期了，请重新选模型）`;
+  }
+  if (cfg.mmproj && !fs.existsSync(String(cfg.mmproj))) {
+    return `llama 视觉投影文件不存在：${cfg.mmproj}（不用视觉就把这一栏留空）`;
+  }
   return null;
 }
 
@@ -2410,7 +2443,7 @@ function listModels() {
   // 草稿头 *.hfq；MTP 边车 *.mtp（由引擎按同目录自动配对，不需要手选）。
   const hf = [];
   const hfdraft = [];
-  for (const d of [HIPFIRE_MODELS_DIR]) {
+  for (const d of HIPFIRE_MODELS_DIRS) {
     if (!fs.existsSync(d)) continue;
     for (const f of fs.readdirSync(d)) {
       const full = path.join(d, f);
