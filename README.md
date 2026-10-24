@@ -41,6 +41,13 @@ start-engine.bat D:\models\qwen3.8-27b.mq4-pro-uniform.hfq
 
 两条路都是**路径无关**的：整个包挪到别的盘、别的目录照样起；配置落在包内 `.hipfire\config.toml`，不碰用户主目录。
 
+### 模型放哪
+
+**放发行包里的 `models\` 目录。** 面板一打开就扫这个目录，主模型、草稿头、`.gguf`、`mmproj`
+全部自动填好；按子文件夹分也行（会往下找一层）。也可以放在 `J:\hipfiremodels`、
+`J:\kvmemmodels`、`G:\models`、`H:\models`，或者任何名字带 kvmem/hipfire 的目录下的 `models\`；
+要指定唯一目录就设环境变量 `KVMEM_HIPFIRE_MODELS_DIR`。
+
 ### 两个引擎怎么切
 
 面板顶部「推理引擎」选 hipfire 或 llama.cpp，点「保存并重启」。首次启动时面板会自己扫描模型目录，

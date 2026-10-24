@@ -80,19 +80,70 @@ const HIPFIRE_BAT        = path.join(HIPFIRE_ROOT, 'hipfire.bat');
 // 和 HIPFIRE_ROOT 一个道理：写死本机路径的发行包，别人拿到只能看到一个扫不出
 // 任何东西的按钮。
 const HIPFIRE_MODELS_DIR = process.env.KVMEM_HIPFIRE_MODELS_DIR || 'J:\\hipfiremodels';
-// 模型实际会被搬到别处 —— 2026-10-25 的真机现场：`J:\\hipfiremodels` 被清空，
-// 全部 .hfq/.gguf 挪进了发行包目录下的 `models\`，于是「扫描模型」什么都扫不到、
-// 切回 hipfire 直接报「主模型不存在」。扫描与自动挑选因此改成多目录，按顺序合并去重。
-// 环境变量 `KVMEM_HIPFIRE_MODELS_DIR` 指定时**只**用它（显式覆盖优先）。
-const HIPFIRE_MODELS_DIRS = process.env.KVMEM_HIPFIRE_MODELS_DIR
-  ? [process.env.KVMEM_HIPFIRE_MODELS_DIR]
-  : [
-      'J:\\hipfiremodels',
-      'J:\\hipfire-kvmem-2.0.0-windows-gfx1100\\hipfire-kvmem-2.0.0\\models',
-      'J:\\kvmemmodels',
-      'G:\\models',
-      path.join(ROOT, 'models'),
-    ].filter((d, i, a) => a.indexOf(d) === i);
+// 模型目录**不能写死**。两次真机事故都出在这上面：
+//   1) `J:\\hipfiremodels` 被清空，模型挪进了发行包目录；
+//   2) 候选表里写死了 `hipfire-kvmem-2.0.0` 的包路径，用户换成 2.1.0 的包后整个表都落空。
+// 所以改成按目录结构动态发现：包自身的 models、常见固定位置、以及 ROOT 各级祖先目录下
+// 任何名字像 kvmem/hipfire 的目录（含它的 models 子目录）。
+function discoverModelDirs() {
+  const out = [];
+  const push = (d) => {
+    if (!d) return;
+    try {
+      if (!fs.statSync(d).isDirectory()) return;
+    } catch { return; }
+    const k = path.resolve(d).toLowerCase();
+    if (!out.some((x) => path.resolve(x).toLowerCase() === k)) out.push(d);
+  };
+  if (process.env.KVMEM_HIPFIRE_MODELS_DIR) { push(process.env.KVMEM_HIPFIRE_MODELS_DIR); return out; }
+  // 包自身
+  push(path.join(ROOT, 'models'));
+  // 常见固定位置
+  for (const d of ['J:\\hipfiremodels', 'J:\\kvmemmodels', 'J:\\models',
+                   'G:\\models', 'H:\\models']) push(d);
+  // 动态发现：ROOT 及其上两级目录里，名字像发行包/kvmem 的目录，及其 models 子目录
+  const ancestors = [];
+  let cur = ROOT;
+  for (let i = 0; i < 3; i++) {
+    cur = path.dirname(cur);
+    if (!cur || ancestors.includes(cur) || path.dirname(cur) === cur) break;
+    ancestors.push(cur);
+  }
+  for (const a of ancestors) {
+    let names = [];
+    try { names = fs.readdirSync(a); } catch { continue; }
+    for (const n of names) {
+      if (!/(kvmem|hipfire)/i.test(n)) continue;
+      const base = path.join(a, n);
+      push(base);
+      push(path.join(base, 'models'));
+      // 发行包常见布局：<解压层>/<同名目录>/models
+      let inner = [];
+      try { inner = fs.readdirSync(base); } catch { continue; }
+      for (const m of inner) {
+        const sub = path.join(base, m);
+        push(sub);
+        push(path.join(sub, 'models'));
+      }
+    }
+  }
+  return out;
+}
+const HIPFIRE_MODELS_DIRS = discoverModelDirs();
+// 候选目录里递归一层列文件：很多人按仓库/量化方分子文件夹放模型
+// （`G:\\models\\ISTA-DASLab\\*.gguf`），只看第一层会全部漏掉。
+function* modelFilesIn(dir, depth = 1) {
+  let ents;
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const e of ents) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (depth > 0) yield* modelFilesIn(full, depth - 1);
+    } else if (e.isFile()) {
+      yield full;
+    }
+  }
+}
 // hipfire 的 serve.port 环境变量是 HIPFIRE_PORT（不是 HIPFIRE_SERVE_PORT）。
 const HIPFIRE_PORT_ENV   = 'HIPFIRE_PORT';
 // memory.kv_cache 的合法值（逐字抄自 hipfire 的报错 Enum，不是 llama.cpp 的 dtype）。
@@ -936,15 +987,14 @@ function pickHf(re, avoid = null, dir = null) {
   // 目录 —— 模型被搬走时自动挑选仍能落到实际存在的那份。
   const dirs = dir ? [dir] : HIPFIRE_MODELS_DIRS;
   for (const d of dirs) {
-    try {
-      if (!fs.existsSync(d)) continue;
-      const names = fs.readdirSync(d).filter((n) => re.test(n)).sort();
-      if (!names.length) continue;
+    for (const full of modelFilesIn(d)) {
+      const n = path.basename(full);
+      if (!re.test(n)) continue;
       // `avoid` 只改变**优先级**，不是判据：即使全都命中也要返回一个，让后置检查
       // 去报明确的错。返回空串的症状是"模型框是空的"，比"选了个过不了门的"更难查。
-      const ok = names.filter((n) => !(avoid && avoid.test(n)));
-      return path.join(d, (ok.length ? ok : names)[0]);
-    } catch {}
+      if (avoid && avoid.test(n)) continue;
+      return full;
+    }
   }
   return '';
 }
@@ -953,9 +1003,12 @@ function pickHf(re, avoid = null, dir = null) {
 function pickName(name) {
   for (const d of HIPFIRE_MODELS_DIRS) {
     try {
-      const full = path.join(d, name);
-      if (fs.existsSync(full)) return full;
+      const direct = path.join(d, name);
+      if (fs.existsSync(direct)) return direct;
     } catch {}
+    for (const full of modelFilesIn(d)) {
+      if (path.basename(full).toLowerCase() === name.toLowerCase()) return full;
+    }
   }
   return '';
 }
@@ -2439,52 +2492,50 @@ async function waitReady(port, host = '127.0.0.1', timeoutMs = 180000) {
 }
 
 function listModels() {
-  const dirs = [path.join(ROOT, 'models')];
+  // 模型的规定位置就是**发行包内的 `models\`**（README 与 models\README.txt 都这么写）。
+  // 这里以包内目录为主，同时按 HIPFIRE_MODELS_DIRS 兜底（模型被搬到别处时仍能找到），
+  // 并且递归一层 —— 很多人按仓库/量化方分子文件夹放。
+  const dirs = [path.join(ROOT, 'models'), ...HIPFIRE_MODELS_DIRS];
   const main = [];
   const mmproj = [];
   for (const d of dirs) {
-    if (!fs.existsSync(d)) continue;
-    for (const f of fs.readdirSync(d)) {
-      if (!/\.gguf$/i.test(f)) continue;
-      const full = path.join(d, f);
-      let mb = 0;
-      try { mb = Math.round(fs.statSync(full).size / 1048576); } catch {}
-      const item = { path: full, name: f, mb };
-      if (/mmproj|projector|vision/i.test(f)) mmproj.push(item); else main.push(item);
+    for (const full of modelFilesIn(d)) {
+      const f = path.basename(full);
+      let mb = 0; try { mb = Math.round(fs.statSync(full).size / 1048576); } catch {}
+      if (/\.gguf$/i.test(f)) {
+        if (/mmproj/i.test(f)) mmproj.push({ path: full, name: f, mb });
+        else main.push({ path: full, name: f, mb });
+      }
     }
   }
-  // 配置里出现的自定义路径也一并列出
-  const cfg = loadConfig();
-  for (const [key, arr] of [['model', main], ['mmproj', mmproj]]) {
-    const v = cfg[key];
-    if (v && fs.existsSync(v) && !arr.some((x) => x.path.toLowerCase() === v.toLowerCase())) {
-      let mb = 0; try { mb = Math.round(fs.statSync(v).size / 1048576); } catch {}
-      arr.push({ path: v, name: path.basename(v), mb });
-    }
-  }
-
-  // ---- hipfire 子引擎：HFQM 权重（私有格式，不是 GGUF）----
-  // 命名约定：主模型 qwen3.8-27b.mq<N>[-pro|-xt|-xts]（无扩展名）；
-  // 草稿头 *.hfq；MTP 边车 *.mtp（由引擎按同目录自动配对，不需要手选）。
   const hf = [];
   const hfdraft = [];
-  for (const d of HIPFIRE_MODELS_DIRS) {
-    if (!fs.existsSync(d)) continue;
-    for (const f of fs.readdirSync(d)) {
-      const full = path.join(d, f);
+  for (const d of dirs) {
+    for (const full of modelFilesIn(d)) {
+      const f = path.basename(full);
       let mb = 0; try { mb = Math.round(fs.statSync(full).size / 1048576); } catch {}
       if (/\.hfq$/i.test(f)) hfdraft.push({ path: full, name: f, mb });
       else if (/\.mq[0-9]/i.test(f)) hf.push({ path: full, name: f, mb });
     }
   }
   for (const [key, arr] of [['hf_model', hf], ['hf_draft', hfdraft]]) {
-    const v = cfg[key];
+    const v = loadConfig()[key];
     if (v && fs.existsSync(v) && !arr.some((x) => x.path.toLowerCase() === v.toLowerCase())) {
       let mb = 0; try { mb = Math.round(fs.statSync(v).size / 1048576); } catch {}
       arr.push({ path: v, name: path.basename(v), mb });
     }
   }
-  return { main, mmproj, hf, hfdraft };
+  // 同一个文件可能被多个候选目录命中（包内 models + 兜底列表），按路径去重后再排序。
+  const dedupe = (arr) => {
+    const seen = new Set();
+    return arr.filter((x) => {
+      const k = path.resolve(x.path).toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    }).sort((a, b) => a.name.localeCompare(b.name));
+  };
+  return { main: dedupe(main), mmproj: dedupe(mmproj), hf: dedupe(hf), hfdraft: dedupe(hfdraft) };
 }
 
 function tailLog(n = 120) {
