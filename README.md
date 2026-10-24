@@ -4,6 +4,8 @@
 
 hipfire 是 Rust 写的 AMD 原生推理引擎，不是 llama.cpp 的分支。KVMem 是那套「显存里只放一个滑动窗口，其余按块换到主机内存」的 KV 管理方案。这个仓库做的是把后者完整搬进前者——逐文件对照上游移植，保留它的打分、图传播、准入与淘汰策略，而不是自己发明一套近似的。
 
+发行包里**两个引擎都在**：hipfire 侧是原生 Rust 实现，llama.cpp 侧是原来的 KVMem 补丁版。面板上一个下拉框切换，同一份配置、同一个端口。
+
 移植后的实测：agent harness（工具调用、多轮、长上下文，最容易把 KV 打爆的那种负载）连续跑 **3 小时 14 分 / 20,928 步 / 峰值深度 198,673 token**，中位 **32.4 tok/s**、单步 **77.8 ms**，全程没有报错，也没有掉到过 15 tok/s 以下。那次跑完，模型自己把一个 Android 项目编译出了 APK。
 
 ## 它解决什么问题
@@ -38,6 +40,22 @@ start-engine.bat D:\models\qwen3.8-27b.mq4-pro-uniform.hfq
 ```
 
 两条路都是**路径无关**的：整个包挪到别的盘、别的目录照样起；配置落在包内 `.hipfire\config.toml`，不碰用户主目录。
+
+### 两个引擎怎么切
+
+面板顶部「推理引擎」选 hipfire 或 llama.cpp，点「保存并重启」。首次启动时面板会自己扫描模型目录，
+把 hipfire 的主模型、草稿头、llama 的 `.gguf` 和 `mmproj` 都填好，不用手工挑。
+
+两个引擎的运行库是分开放的，因为都要一个叫 `amdhip64.dll` 的文件、版本却不同：
+
+```
+bin\           hipfire.exe + daemon.exe
+bin\runtime\   amdhip64.dll  （HIP 10.x，hipfire 用）
+llama\          llama-kvmem-server.exe + ROCm 7.x 的运行库（llama.cpp 用）
+share\kvmem\    llama.cpp 侧的网页 UI
+```
+
+面板会按是否存在 `llama\llama-kvmem-server.exe` 自动判定，并把该目录加进子进程 PATH。
 
 ## 两档配置
 
@@ -83,6 +101,10 @@ start-engine.bat D:\models\qwen3.8-27b.mq4-pro-uniform.hfq
 
 ## 已知边界
 
+**两个引擎的 KVMem 实现不是同一份代码。** hipfire 侧是本次移植的版本（含三处缺陷修复：准入页数算术、
+KV 采集阻塞回读、冷回合窗口释放）；llama.cpp 侧沿用 v1.x 的补丁集，没有这三条修复。所以压力测试的
+结论只对 hipfire 侧成立。
+
 **288 页窗口是硬口径。** agent harness 会压缩历史：某次它把 196148 token 的历史压成 168776 token 的提示词，前缀在 42% 处就分叉了。复用点落在窗口之外时只能整段重填，15 万 token 大约七分钟。这种冷回合跑几小时会遇到几次，但不会再变成 503——修三就是为这个。
 
 **模型不在包里。** qwen3.8-27b 这一档约 15 GB，用 `hipfire quantize` 自己做 `.hfq`，或者从别处拿。包里只带引擎、HIP 运行库（16 MB 的 `amdhip64.dll`）和预编译内核（744 个 `.hsaco`，11 MB）。
@@ -97,6 +119,8 @@ start-engine.bat     只起引擎
 start-panel.bat      起面板
 config.json          面板配置（不含模型路径，进来先选模型）
 bin/                 hipfire.exe + daemon.exe + runtime/amdhip64.dll
+llama/               llama-kvmem-server.exe + ROCm 7.x 运行库（llama.cpp 引擎）
+share/kvmem/ui/      llama.cpp 侧的网页 UI
 .hipfire_kernels/    预编译内核
 .hipfire/            引擎配置（首次启动自动生成/更新）
 panel/               中文调参面板

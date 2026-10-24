@@ -36,17 +36,26 @@ const PKG_ROOT = (fs.existsSync(path.join(PARENT_DIR, 'bin', 'llama-kvmem-server
 const ROOT = PKG_ROOT;
 // 运行时目录：发行包里就是包根（bin/ + share/ 在根下），开发树里是那个临时
 // 解出来的发布目录。同样按存在性判定。
-const RUN_DIR = fs.existsSync(path.join(PKG_ROOT, 'bin', 'llama-kvmem-server.exe'))
-  ? PKG_ROOT
+// 双引擎发行包里，llama 服务与它的 ROCm 运行库单独放在 `<包根>\llama\` ——
+// 不能和 hipfire 的 `bin\runtime\amdhip64.dll`（HIP 10.x）混在一起：两个引擎都要
+// 一个叫 `amdhip64.dll` 的文件，但版本不同（llama 要 ROCm 7.x 的）。
+const LLAMA_DIR = path.join(PKG_ROOT, 'llama');
+const LLAMA_EXE_IN_LLAMA_DIR = path.join(LLAMA_DIR, 'llama-kvmem-server.exe');
+const RUN_DIR = fs.existsSync(LLAMA_EXE_IN_LLAMA_DIR) ? PKG_ROOT
+  : fs.existsSync(path.join(PKG_ROOT, 'bin', 'llama-kvmem-server.exe')) ? PKG_ROOT
   : (fs.existsSync(path.join(PKG_ROOT, 'bin', 'daemon.exe'))
       ? PKG_ROOT
       : path.join(PKG_ROOT, 'kvmem-rocm-windows-review'));
 const BIN_DIR = path.join(RUN_DIR, 'bin');
-const UI_DIR = path.join(RUN_DIR, 'share', 'kvmem', 'ui');
+const UI_DIR = fs.existsSync(path.join(PKG_ROOT, 'share', 'kvmem', 'ui'))
+  ? path.join(PKG_ROOT, 'share', 'kvmem', 'ui')
+  : path.join(RUN_DIR, 'share', 'kvmem', 'ui');
 // Prefer the locally built three-in-one binary (KVMem + ROCmFP4 + DFlash2)
 // when present; otherwise fall back to the shipped runtime package.
 const BUILT_SERVER = path.join(PKG_ROOT, 'build-fp4', 'bin', 'llama-kvmem-server.exe');
-const SHIPPED_SERVER = path.join(BIN_DIR, 'llama-kvmem-server.exe');
+const SHIPPED_SERVER = fs.existsSync(LLAMA_EXE_IN_LLAMA_DIR)
+  ? LLAMA_EXE_IN_LLAMA_DIR
+  : path.join(BIN_DIR, 'llama-kvmem-server.exe');
 const USE_BUILT = fs.existsSync(BUILT_SERVER);
 const SERVER_EXE = USE_BUILT ? BUILT_SERVER : SHIPPED_SERVER;
 // The locally built binary links against the standard ROCm 7.2 runtime, which
@@ -940,12 +949,24 @@ function pickHf(re, avoid = null, dir = null) {
   return '';
 }
 
+// 按文件名在模型候选目录里找第一份存在的（gguf/mmproj 用；.hfq 走 pickHf 的正则挑选）。
+function pickName(name) {
+  for (const d of HIPFIRE_MODELS_DIRS) {
+    try {
+      const full = path.join(d, name);
+      if (fs.existsSync(full)) return full;
+    } catch {}
+  }
+  return '';
+}
+
 function defaultConfig() {
   const cfg = {};
   const modelDir = path.join(ROOT, 'models');
   for (const p of ALL_PARAMS) {
     if (p.type === 'bool') cfg[p.id] = p.default ?? false;
-    else if (p.id === 'model') cfg[p.id] = path.join(modelDir, 'Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf');
+    else if (p.id === 'model') cfg[p.id] = pickName('Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf')
+      || path.join(modelDir, 'Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf');
     else if (p.id === 'model_draft') cfg[p.id] = '';   // only for draft-dflash; never auto-fill
     else if (p.id === 'hf_model') cfg[p.id] = pickHf(/\.mq[0-9]/i, HF_MODEL_SLOT_INCOMPATIBLE);
     // 草稿头：**先认 dflash 命名的**，没有再回落到任意 .hfq。
@@ -953,7 +974,8 @@ function defaultConfig() {
     // 草稿头。回落保留旧行为当兜底：选错了 hipfire 会明确报错退出（它要求
     // registry 登记的模型，按路径给的文件拿不到登记信息），不会静默出错。
     else if (p.id === 'hf_draft') cfg[p.id] = pickHf(/dflash.*\.hfq$/i) || pickHf(/\.hfq$/i);
-    else if (p.type === 'mmproj') cfg[p.id] = path.join(modelDir, 'mmproj-Qwen3.8-27B-BF16.gguf');
+    else if (p.type === 'mmproj') cfg[p.id] = pickName('mmproj-Qwen3.8-27B-BF16.gguf')
+      || path.join(modelDir, 'mmproj-Qwen3.8-27B-BF16.gguf');
     else cfg[p.id] = p.optional ? (p.default ?? '') : (p.default ?? '');
   }
   return cfg;
@@ -2281,8 +2303,11 @@ function enginePrecheck(cfg) {
 function cleanPath() {
   const parts = (process.env.PATH || '').split(';').filter((p) => p && !/TheRock/i.test(p) && !/AMD.ROCm/i.test(p));
   // The locally built binary needs the standard ROCm 7.2 runtime DLLs.
+  // 发行包把 ROCm 7.x 的 DLL 和 llama 服务放在同一目录（`<包根>\llama\`），
+  // 而系统 ROCm 只在开发机上才有 —— 所以服务程序所在目录必须进 PATH，
+  // 否则发行包里的 llama 引擎会因为找不到 amdhip64.dll 而直接起不来。
   return USE_BUILT ? [path.dirname(SERVER_EXE), ROCM_RUNTIME_BIN, ...parts].join(';')
-                   : [BIN_DIR, ...parts].join(';');
+                   : [path.dirname(SERVER_EXE), BIN_DIR, ...parts].join(';');
 }
 
 function serverArgsPreview(cfg) {
