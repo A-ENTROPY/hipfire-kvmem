@@ -15,6 +15,25 @@ v2.1.0 发出去之后发现两个扫描缺陷，模型放在包里却扫不出�
 `G:\models\ISTA-DASLab\*.gguf` 这种按仓库分文件夹的结构完全看不见 —— `main` / `mmproj`
 一直是 0。现在递归一层，并且同一份文件被多个候选目录命中时按路径去重。
 
+**三、llama 引擎缺 rocBLAS / hipBLASLt 的数据目录（会直接崩溃）。**
+
+v2.1.1 首次上传时包里只拷了 `rocblas.dll`、`hipblaslt.dll`，**没拷它们要找的数据目录**
+（`rocblas\library\`、`hipblaslt\library\`）。表现是引擎能加载、能监听，一处理请求就崩：
+
+```
+rocBLAS error: Cannot read ...\llama\/rocblas/library/TensileLibrary.dat:
+  No such file or directory for GPU arch
+rocBLAS error: Could not initialize Tensile host
+```
+
+现在按 gfx1100 精简后随包提供（无架构后缀的 fallback 库 + gfx1100 专用，共 55 MB，
+原目录 1016 MB）。其它 RDNA 卡（gfx1201/gfx1150 等）需要时从对应 ROCm 安装的
+`bin\rocblas\library` 与 `bin\hipblaslt\library` 补齐即可。
+
+用 1M 上下文实测：`n_ctx=1000000` 正常加载，21 prompt / 53 completion token、27.65 tok/s 解码，
+rocBLAS 无报错。**KVMem 模式支持 1M 上下文**，之前崩的是缺文件、不是上下文超限。
+（模型本身的 `n_ctx_train` 是 262144，超过会有训练上下文溢出的警告，但这不影响运行。）
+
 ## 模型放哪（写进 README 与 models\README.txt）
 
 **发行包里的 `models\` 目录就是本项目的规定位置**，面板打开即扫、自动填好四项：
