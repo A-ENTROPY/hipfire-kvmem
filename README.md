@@ -1,264 +1,116 @@
-# KVMem + ROCmFP4 + DFlash2 for AMD
+# hipfire × KVMem
 
-**在 AMD Radeon（gfx1100 / gfx1151）上跑满 256K 上下文的 Qwen3.8-27B，并用 DFlash2 把解码速度推到 48–53 tok/s。**
+**把 KVMem 的分页 KV 移植进 hipfire 这个 RDNA 原生引擎，让 262144 上下文在 24 GB 显卡上真正跑起来。**
 
-> 把三件事合进一个 llama.cpp 构建：**[KVMem](https://github.com/kvmem/kvmem-llama.cpp)** 的分层 KV（显存恒定、上下文可到 256K）、**[ROCmFP4](https://github.com/charlie12345/rocmfp4-llama)** 的 AMD 专用 4-bit 量化格式（类型 100/101），以及 **[DFlash2](https://inco.ai/blog/dflash2/)** 的块扩散并行草稿推测解码。
->
-> One llama.cpp build that combines three things: **KVMem** tiered KV (constant VRAM, up to 256K context), **ROCmFP4** AMD-specific 4-bit formats (ggml types 100/101), and **DFlash2** block-diffusion speculative decoding.
+hipfire 是 Rust 写的 AMD 原生推理引擎，不是 llama.cpp 的分支。KVMem 是那套「显存里只放一个滑动窗口，其余按块换到主机内存」的 KV 管理方案。这个仓库做的是把后者完整搬进前者——逐文件对照上游移植，保留它的打分、图传播、准入与淘汰策略，而不是自己发明一套近似的。
 
-📦 **开箱即用的预编译包：[v1.0.0 Release](https://github.com/A-ENTROPY/kvmem-rocmfp4/releases/tag/v1.0.0)** —— Windows x64 + ROCm 7.2，已含运行库（229 MB），无需自己编译。
+移植后的实测：agent harness（工具调用、多轮、长上下文，最容易把 KV 打爆的那种负载）连续跑 **3 小时 14 分 / 20,928 步 / 峰值深度 198,673 token**，中位 **32.4 tok/s**、单步 **77.8 ms**，全程没有报错，也没有掉到过 15 tok/s 以下。那次跑完，模型自己把一个 Android 项目编译出了 APK。
 
----
+## 它解决什么问题
 
-## ✨ 为什么值得用 / Why
+27B 模型按 Q8 存 KV，每 1000 token 大约 34 MB。262144 上下文光 KV 就要 9 GB 上下，再叠 14.6 GB 权重，24 GB 的卡装不下。
 
-| 痛点 | 这个构建怎么解 |
-|---|---|
-| 27B 模型 + 256K 上下文，KV 缓存爆显存 | **KVMem** 把 GPU KV 压成固定预算（本机 256K 配置下约 2.4 GB），历史存主机内存、按查询检索回显存 |
-| AMD 卡缺少高效 4-bit 内核 | **ROCmFP4**：`Q4_0_ROCMFP4`(4.50 bpw) / `Q4_0_ROCMFP4_FAST`(4.25 bpw)，带 HIP 向量点积 / MMQ / FlashAttention 内核 |
-| 原生解码速度上不去 | **DFlash2** 一次验证一个草稿块，实测 **+24%**（首个长生成 38.8 → 48.1 tok/s） |
-| 上游 llama.cpp 只认类型 0–42，加载不了 FP4 模型 | 本仓库的构建已含类型 100/101，可直接加载 |
+KVMem 的办法是只把一部分 KV 留在显存里：
 
-**一句话**：这是目前能在消费级 AMD 卡上同时拿到「超长上下文 + FP4 量化 + 推测解码」的一条完整路径。
-
----
-
-## 📊 实测性能 / Benchmarks
-
-**测试平台**：AMD Radeon **RX 7900 XTX**（gfx1100，RDNA3，24 GB）· 24 核 / 32 线程 · 64 GB DDR4-3200 · Windows · ROCm 7.2（HIP 7.2.60201）
-
-**模型**：`Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf`（13.75 GB）+ DFlash2 草稿 `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`（1.06 GB）
-
-**配置**：`-c 32768`、`--kvmem --kvmem-budget 8192 --kvmem-gen-reserve 4096`、`--kv-dtype q8_0`、greedy
-
-| 配置 | 首次长生成 (≈470 tok) | 上下文增长后 (≈410 tok) |
-|---|---:|---:|
-| 原生解码（`--spec-type none`） | 38.8 tok/s | 38.9 tok/s |
-| **+ DFlash2 (`--spec-draft-n-max 3`)** | **48.1 tok/s（+24%）** | 40.5 tok/s（+4%） |
-| + DFlash2 (`--spec-draft-n-max 5`) | 45.8 tok/s | 36.7 tok/s |
-
-- **峰值**：短上下文下 3 秒窗口瞬时速率最高观测到 **53.0 tok/s**
-- **草稿数用 3 最好**；调到 5 或 7 反而更慢（草稿接受率下降 37% → 19%，验证开销抵消收益）
-- 数字为逐请求归因到服务端 `eval time` 计时行，非平均值套算
-
-> 另：**256K 上下文本身几乎没有速度惩罚**（同条件下 32K 时 51.5 vs 256K 时 52.0 tok/s），这正是 KVMem 的核心价值。
-
----
-
-## 🚀 快速开始 / Quick Start
-
-### 方式一：下载预编译包（推荐）
-
-**三步，零参数：**
-
-1. 到 [Releases](../../releases) 下载 `kvmem-rocmfp4-gfx1100-windows-rocm7.2-selfcontained.zip` 并解压
-2. 把下载好的 `.gguf` 模型**丢进包内的 `models\` 目录**（下载清单见 [`models\把模型放这里.md`](release/models/把模型放这里.md)）
-3. **双击 `start-kvmem.bat`**
-
-脚本会**自动扫描 `models\`**，识别出「主模型 / DFlash2 草稿 / 视觉投影器」，自动组合出最优配置并启动：
-
-```
-============================================================
-   KVMem + ROCmFP4 + DFlash2
-============================================================
-   模型目录: ...\models
-
-   扫描结果:
-      [视觉投影  ] mmproj-Qwen3.8-27B-BF16.gguf  (888.0 MB)  <- 选用
-      [DFlash2草稿] Qwen3.8-27B-DFlash2-Q4_K_M.gguf  (1.06 GB)  <- 选用
-      [主模型    ] Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf  (13.75 GB)  <- 选用
-
-   将使用:
-      主模型   : Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf
-      草稿模型 : Qwen3.8-27B-DFlash2-Q4_K_M.gguf
-      加速方式 : DFlash2（推荐，实测 +24%）
-      上下文   : 262144   检索窗口: 36864   单轮上限: 32768
-
-   界面: http://127.0.0.1:18200/
-```
-
-浏览器打开 `http://127.0.0.1:18200/` 即可。包内已含 ROCm 运行库（`amdhip64_7.dll` / `hipblas` / `rocblas`），**无需自行安装 ROCm**。
-
-**没放模型会怎样？** 脚本会打印需要下载哪个文件、放哪里、下载链接是什么，然后退出——不会给你一堆看不懂的报错。
-
-**智能降级**：只有主模型没有 DFlash2 草稿时，会自动改用主模型自带的 MTP；两者都没有就自动关闭推测解码，并提示你去下载草稿模型。
-
-**方式三：中文调参面板（功能最全）**
-
-```powershell
-.\start-panel.bat
-```
-
-会启动一个**中文 Web 调参面板**（`http://127.0.0.1:18201/`），自动打开浏览器，并按当前配置启动模型服务。详见下方[中文调参面板](#%EF%B8%8F-中文调参面板--tuning-panel)。
-
-> 面板需要本机装有 [Node.js](https://nodejs.org/)；没装的话脚本会提示，用 `start-kvmem.bat` 一样能跑（只是改参数没面板方便）。
-
-**可选参数**（都不需要就能跑）：
-
-```powershell
-.\start-kvmem.bat -List                    # 只列出识别结果，不启动
-.\start-kvmem.bat -DryRun                  # 只打印将执行的命令
-.\start-kvmem.bat -ModelsDir "D:\models"   # 模型放在别处
-.\start-kvmem.bat -Spec none               # 关闭推测解码
-.\start-kvmem.bat -Context 32768           # 小上下文，省显存
-```
-
-### 方式二：从源码编译
-
-见 [`docs/BUILD.md`](docs/BUILD.md)。三步：
-
-```powershell
-# 1) 取 ROCmFP4 基线（与 KVMem 钉定版本仅差 8 个提交，补丁零冲突）
-.\scripts\fetch-llama-and-patch.ps1
-# 2) 编译（MSVC 14.44 + Ninja + ROCm 7.2，目标 gfx1100）
-.\scripts\build-windows.bat
-# 3) 打包
-.\scripts\package-runtime.ps1
-```
-
----
-
-## 🧩 三个组件是怎么合的 / How it fits together
-
-```
-上游 llama.cpp（ROCmFP4 移植分支 rocmfp4-pre-3466812d-20260902）
-        │  基线 3466812d 与 KVMem 钉定的 b81c99b 仅差 8 个提交
-        ├─ + KVMem 补丁（patches/llama-kvmem-current.patch）   → 零冲突
-        │     └─ 分层 KV：GPU 块-槽池 = budget + gen_reserve，历史落主机内存
-        ├─ + ROCmFP4（该分支自带）                             → 类型 100/101 可加载
-        └─ + DFlash2（该基线已含上游 PR #27342）               → --spec-type draft-dflash
-              └─ 本仓库的改动：让 KVMem 的推测解码回路支持独立草稿模型
-```
-
-**本仓库在 KVMem 侧的关键改动**（4 个文件，见 `patches/dflash2-kvmem-tools.diff`）：
-
-| 改动 | 说明 |
-|---|---|
-| 放开 `--spec-type` 白名单 | 原来硬编码只认 `draft-mtp \| none`，现支持 `draft-dflash` |
-| 新增 `-md, --model-draft PATH` | 指定独立草稿模型 GGUF |
-| `kvmem_spec_opts.spec_type` 可配置 | 原来硬编码 `COMMON_SPECULATIVE_TYPE_DRAFT_MTP` |
-| **`kvmem_draft_rewind()` 统一回滚** | MTP 走 KVMem 逻辑接口；DFlash 走标准 `llama_memory_seq_rm` |
-| 5 处 MTP 专用逻辑加 DFlash 分支 | 检查点 carry、行同步校验、草稿 KV 截断等 |
-
-> 💡 **最后一个改动是让 DFlash2 真正跑通的关键**：KVMem 原本用自家的逻辑移除接口回滚草稿 KV，
-> 但 DFlash 的草稿上下文是**原生 KV**（未经 KVMem 管理），必须换成标准序列 API 才能正确回滚。
-> 否则草稿位置会持续超出目标，报 `llama_decode(ctx_dft) failed ... X <= Y`。
-
----
-
-## ⚙️ 两种加速方式怎么选 / MTP vs DFlash2
-
-| | MTP（`draft-mtp`） | DFlash2（`draft-dflash`） |
+| 组成 | 大小 | 说明 |
 |---|---|---|
-| 草稿来源 | 主模型自带的 nextn 头 | **独立草稿模型 GGUF** |
-| 适用模型 | 文件名带 `-mtp` 的模型 | 任意 Qwen3.8-27B 目标模型 |
-| 本机实测 | IQ3_S + MTP2 = 37.5 tok/s | FP4 + DFlash2(n=3) = 48.1 tok/s |
-| 额外显存 | 很小（共享槽池） | 草稿模型 ~1 GB + 其 KV |
+| sink | 16384 token | 提示词开头（系统提示 + 工具 schema），永不淘汰 |
+| recent | 8 页 / 1024 token | 最近写入的尾巴 |
+| 打分填充 | 剩余约 152 页 | 按查询相关性排序挑出来 |
 
-**结论**：模型带 MTP 头就用 MTP；想用 FP4 量化或追求更高速度就用 DFlash2。
+窗口一共 288 页 = 36864 token，显存池 425 页 = 54400 token，其余全部落在 12 GB 主机层（2891 个块槽位，约 37 万 token）。换入换出按块走，块大小 128 token。
 
-⚠️ 实测 **DFlash2 配 IQ3_S（GDN 混合架构）反而慢到 12.6 tok/s**，故推荐两种组合：
-`FP4 模型 + DFlash2`（速度优先）与 `IQ3_S + MTP2`（长上下文优先）。
+## 快速开始
 
----
+需要：Windows x64、gfx1100 / gfx1101 / gfx1201 这类 RDNA 卡、Node.js 18+（用面板的话）。
 
-## 🎛️ 中文调参面板 / Tuning panel
-
-```powershell
-.\start-panel.bat          # 启动面板（自动开浏览器）
-```
-
-面板是本项目自带的**全中文参数控制台**（`http://127.0.0.1:18201/`），把所有可调参数做成表单：
-
-| 能力 | 说明 |
-|---|---|
-| **参数全覆盖** | 全部可调项分组呈现：模型与视觉 / 设备与显存 / 上下文与批处理 / KVMem 核心 / KV 缓存精度 / 推测解码加速 / 采样 / 思考与模板 / 服务与网络 / 日志诊断 |
-| **中文标注** | 每项都有中文说明，并直接标出**本机实测推荐值**（如「MTP2 比 MTP3 快」「草稿数用 3 最佳」） |
-| **持久保存** | 点保存即写入 `config.json`，下次启动自动沿用 |
-| **一键生效** | 「保存并重启」会重启服务并应用新参数（实测约 10 秒，含模型重载） |
-| **模型切换** | 下拉框自动列出 `models\` 目录里扫到的所有 GGUF，随时换主模型 / 草稿模型 / 视觉投影器 |
-| **服务控制** | 面板自己管理服务进程：启动 / 停止 / 重启 / 看实时日志 / 看运行状态 |
-| **坑位已修正** | `--threads` 与 `--flash-attn` 默认**留空**（填 0 或 on 会让速度腰斩，实测数据写在提示里） |
-
-典型界面（分组标签）：
+发行包解压后有两个入口：
 
 ```
-⚡ 推测解码加速    推断解码模式 [draft-dflash ▾]  草稿模型 [Qwen3.8-27B-DFlash2-Q4_K_M.gguf ▾]
-                  草稿 token 数 [3]   草稿 KV 类型 [f16 ▾]   草稿最低概率 [0]
-🧠 KVMem 核心     GPU 预算 36864  单轮上限 32768  检索方式 retrieval  查询策略 user ...
-💾 设备与显存     GPU [-ngl 99]   KV 类型 q8_0   Flash Attention [留空 ▾]   CPU 线程数 [留空]
+start-panel.bat     中文调参面板（推荐），127.0.0.1:18201
+start-engine.bat    只起引擎，OpenAI 兼容接口 + 内置网页 UI
 ```
 
-改完点 **保存并重启** 即可，无需手工敲命令行。
+`start-panel.bat` 会自己把引擎拉起来，模型在面板里选。`start-engine.bat` 直接吃 `models\` 里第一个 `.hfq`，也可以把路径当参数传进去：
 
-> 面板与 `start-kvmem.bat` 共用同一个 `models\` 目录和 `config.json`：
-> 用面板调好参数后，也可以直接双击 `start-kvmem.bat` 快速启动（它会读同一套自动识别逻辑）。
+```
+start-engine.bat D:\models\qwen3.8-27b.mq4-pro-uniform.hfq
+```
 
----
-## ⚠️ 两个会让速度腰斩的坑 / Two traps that halve your speed
+两条路都是**路径无关**的：整个包挪到别的盘、别的目录照样起；配置落在包内 `.hipfire\config.toml`，不碰用户主目录。
 
-实测（RX 7900 XTX，DFlash2 n=3）：
+## 两档配置
 
-| 参数 | 错误值 | 后果 | 正确做法 |
-|---|---|---|---|
-| `--threads` | `0`（用满 32 线程） | 51.5 → **26.6** tok/s（-48%） | **不加 / 留空**（用 llama.cpp 默认） |
-| `--flash-attn` | `on` | 52.0 → **29.3** tok/s（-44%） | **不加 / 留空**（auto） |
+面板里一键切换，或者直接套 `presets\` 里的文件。
 
-两项叠加能把 50 tok/s 打到 13 tok/s。GPU 全卸载时，空转的 CPU 线程会争抢采样与图调度，反而拖慢。
+**性能档（默认）**——打分器 `meanq-cosine`，聚合取 max，LRFU 开，图传播关。选块偏向「最近用过」的连续段，窗口不怎么翻页。
 
----
+**质量档**——打分器 `page-softmax`，聚合取 mean，LRFU 关，图传播 α=0.2。按查询相关性全局重排窗口。
 
-## 📋 测试过的模型 / Tested models
+两档实测速度没有差别（同 288 页窗口：中位 32.4 vs 32.6 tok/s，单步都是 77.8 ms）。早先我以为质量档慢一倍，后来查清楚是 KV 采集路径上每层一次阻塞回读，跟打分器无关，那个问题已经修掉了。
 
-**模型不随本仓库分发**，请自行下载：
+## 这个移植里修掉的三件事
 
-| 用途 | 模型 | 大小 | 来源 |
-|---|---|---|---|
-| ★ 推荐主模型（FP4） | `Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf` | 13.75 GB | ROCmFP4 量化产物（见 [ROCmFP4 仓库](https://github.com/charlie12345/rocmfp4-llama)说明） |
-| KVMem 官方配方主模型 | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` | 11.29 GB | [ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF) |
-| ★ DFlash2 草稿模型 | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1.06 GB | [incoai/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF) |
-| 视觉投影（可选） | `mmproj-Qwen3.8-27B-BF16.gguf` | 0.87 GB | [HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF](https://huggingface.co/HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF) |
+都能在日志里指出具体一行，不是「优化了一下」。
 
-以上均已实测可用。其他同架构的 Qwen3.8-27B 变体理论上兼容，但未逐一测试。
+**一、准入页数算错，压测会被 503 打断。** 续写时引擎要判断这一步还需要几页，抵扣量原本用 `descriptor.seq_len`。可对分页槽来说那只是最后一次写前沿的戳：一次 165k 的深回合会把它留在 16438，而块表里实际已经物化了 288 页。少抵 159 页，真实需求 9 页被算成 168 页，池子只剩 136 页空闲，于是判定「需求超过池容量」、`retryable=false`，请求连报六次之后整场压测结束。抵扣改成用块表已物化的页数。
 
----
+**二、KV 采集每层一次阻塞回读，把解码拖到 13 tok/s。** `step_overlaps_query()` 在拿不到本轮提问位置区间时（agent 回合以工具结果结尾很常见）返回「重叠」，于是十六个全注意力层**每层**都走一次 `download_f32`——`memcpy_dtoh` 会抽干 GPU 队列。表现是 `harvest` 从 40 ms 一路爬到 123 ms、占满整个 forward，其余五段恒定在 0.1–0.3 ms，GPU 占用掉到 53%，速度从 27 掉到 10.9。改成空区间不回读、只用设备累加器，阻塞回读归零。
 
-## 🖥️ 支持范围 / Support
+**三、冷回合没释放上一轮的窗口，冷预填撞洞报 503。** `rewind_to(0)` 只清 tier 的登记，不动 pool 里那张旧窗口表；紧随其后的「洞自检」又因为 `registered_tokens()` 刚被清成 0 而进不去，`pool.release` 从来没执行过。冷预填从第 0 页开始写，那些页既不在旧窗口里、也追加不到它的尾部，provisioning 一路拒绝，最后变成 `server capacity exhausted`。修法是把同函数里早就在用的 `rewind_to(0) + pool.release` 这一对补到冷回合分支。
 
-| 项 | 状态 |
-|---|---|
-| GPU 架构 | **gfx1100（RX 7900 XTX）已实测**；构建脚本支持 gfx1030 / gfx1100 / gfx1151 / gfx1200 |
-| 操作系统 | Windows x64（预编译包）；Linux 可参照 `scripts/` 自行编译 |
-| ROCm | 7.2（HIP 7.2.60201）实测 |
-| 多 GPU | ❌ KVMem 不支持 |
-| NVMe offload | ❌ 当前 Windows 构建未启用 |
+## 单步成本长什么样
 
-> ⚠️ RDNA3.5（Strix Halo / gfx1151）是 ROCmFP4 的官方调优目标，本仓库的 gfx1100 路径属社区验证方向。
-> 两者都应能工作，但本文性能数字**仅对 gfx1100 有效**。
+引擎自带分段计时，`server.log` 每 64 步打一行：
 
----
+```
+[serve] decode gap: 77.8 ms/decode-step over 20121 steps
+[serve] fwd split: 上传 0.4 | 逐层 46.3（DeltaNet×48 1.2 / FullAttn×16 45.2）| lm_head 0.0 ms
+[serve] fa split: 投影+norm 0.1 | harvest 44.7 | RoPE 0.0 | KV写入 0.1 | 注意力 0.1 | 后段 0.2 ms
+[serve] harvest 分解: flush D2H 12.3 次/44.5 ms | 发射 64.0 次/0.1 ms | add_layer 16.0 次/44.7 ms
+[serve] harvest 分支: 设备累加 16.0 层/步 | 阻塞下载 0.0 层/步
+```
 
-## 📌 已知限制 / Known limitations
+77.8 ms 里，46 ms 是 64 层的权重流（48 层线性注意力只用 1.2 ms，16 层全注意力 45.2 ms），30 ms 花在采样与提交。那 44.7 ms 的 `harvest` 是块均值回写，每步约 12 次回读。这段还有压缩空间——改成层内异步落盘、整步一次回读，单步能再降一截——但那是下一轮的事。
 
-1. **单轮生成受 `--kvmem-gen-reserve` 限制**（含思考内容）。要写长文就把它调大（用显存换长度）。
-2. **DFlash2 收益随上下文增长而衰减**（首轮 +24% → 上下文变长后 +4%）。
-3. **DFlash2 与 GDN 混合模型（如 IQ3_S）不合**，会显著变慢。
-4. 草稿数不是越大越好，`3` 是本机最佳。
-5. `--threads 0` / `--flash-attn on` 会让速度腰斩，务必留空。
-6. ROCmFP4 在 gfx1151 上的路径未经本仓库验证。
+## 已知问题
 
----
+**DFlash 推测解码目前比 MTP 慢，建议先用 MTP。** 实测同一台机器、同一模型：DFlash（B=16）单步 **219 ms**、15 tok/s，其中主模型 forward 只要 3.2 ms，成本几乎全在 forward 之后的草稿与验证段；MTP 单步 77.8 ms、32 tok/s。每步 16 个草稿只接受约 3.3 个，接受率约 20%，草稿的代价没收回来。这次测试跑在 21,750 深度（小于 36,864 窗口），`[kv] 打分` 零次、`tier transfer` 累计 0，所以**与 KVMem 分页无关**，是推测解码路径本身的账。
 
-## 📄 许可证与致谢 / License & Credits
+**由此还带出一个潜在断崖，用它之前请先知道：** KV 采集的设备累加器门槛是 `DECODE_CAPTURE_MAX_ROWS = 12` 行，而 DFlash 的验证批是 16 行。浅上下文（窗口内）没问题，一旦深度超过窗口、采集被激活，16 行会退回**每层一次阻塞回读**——正是把解码拖到 13 tok/s 的那个老病灶。所以现在这套组合下，**DFlash + 深上下文有掉速风险**，修复方式是把这个阈值抬到 32（设备累加器本身按行累加、按块边界 flush，16 行撑得住）。
 
-本仓库是以下项目的集成与移植，**先向原作者致敬**：
+**DFlash 下分段计时是盲的。** `fwd split` / `fa split` / `harvest 分支` 的门槛是 `n <= 8`，`draft prof` 只统计 MTP。所以 DFlash 出问题时只能从总时长反推，看不到「16 行验证」与「草稿模型」各占多少。这两处诊断门槛下一步会按 `spec_rows` 判定。
 
-- **[KVMem](https://github.com/kvmem/kvmem-llama.cpp)** —— 分层 KV 内存与检索式工作集（[论文 arXiv:2609.04852](https://arxiv.org/abs/2609.04852)）
-- **[ROCmFP4 / charlie12345](https://github.com/charlie12345/rocmfp4-llama)** —— AMD 专用 4-bit 量化格式与 HIP 内核
-- **[walcz-de/llama.cpp-ROCmFP4](https://github.com/walcz-de/llama.cpp-ROCmFP4)** —— 把 ROCmFP4 移植到新版上游基础上（本仓库的基线来源）
-- **[DFlash2 / Inco AI](https://inco.ai/blog/dflash2/)** —— 块扩散并行草稿（上游 [llama.cpp PR #27342](https://github.com/ggml-org/llama.cpp/pull/27342)）
-- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** —— 推理引擎本体
+## 已知边界
 
-本仓库自身的改动以 MIT 许可发布（见 [LICENSE](LICENSE)）；上游各组件的许可与署名见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+**288 页窗口是硬口径。** agent harness 会压缩历史：某次它把 196148 token 的历史压成 168776 token 的提示词，前缀在 42% 处就分叉了。复用点落在窗口之外时只能整段重填，15 万 token 大约七分钟。这种冷回合跑几小时会遇到几次，但不会再变成 503——修三就是为这个。
 
-**本仓库不分发模型权重**，使用模型请遵守其各自许可条款。
+**模型不在包里。** qwen3.8-27b 这一档约 15 GB，用 `hipfire quantize` 自己做 `.hfq`，或者从别处拿。包里只带引擎、HIP 运行库（16 MB 的 `amdhip64.dll`）和预编译内核（744 个 `.hsaco`，11 MB）。
+
+**ROCm 只要有 HIP 运行库就能跑。** 预编译内核覆盖 gfx1100，正常运行不调用编译器。要现场编译内核才需要完整 ROCm 和 MSVC 头——`hipfire.bat` 会自动 call vcvars64 并把 VC98 的 include 剔掉（不剔会拿到 1998 年的 cstdlib）。
+
+## 目录结构
+
+```
+hipfire.bat          启动器（路径无关，纯 ASCII，别往里写中文）
+start-engine.bat     只起引擎
+start-panel.bat      起面板
+config.json          面板配置（不含模型路径，进来先选模型）
+bin/                 hipfire.exe + daemon.exe + runtime/amdhip64.dll
+.hipfire_kernels/    预编译内核
+.hipfire/            引擎配置（首次启动自动生成/更新）
+panel/               中文调参面板
+presets/             性能档 / 质量档 等预设
+scripts/             recall A/B、预设构建、预设回环校验
+docs/                对齐文档与性能断崖调查
+models/              放 .hfq
+```
+
+## 文档
+
+- [`docs/KVMem-0.18-ALIGNMENT.md`](docs/KVMem-0.18-ALIGNMENT.md) — 逐项对齐表、逐位对拍、C 档实测
+- [`docs/PERF-CLIFF-2026-10-23.md`](docs/PERF-CLIFF-2026-10-23.md) — 速度断崖的完整调查记录
+
+## 旧版
+
+这个仓库的 v1.x 走的是另一条路：llama.cpp + ROCmFP4 + KVMem 补丁的 C++ 构建。那套仍在 release 里可取，源码在 git 历史里（本仓库改成 hipfire 版之前的所有提交）。

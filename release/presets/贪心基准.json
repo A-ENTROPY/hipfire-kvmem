@@ -1,0 +1,11 @@
+{
+  "name": "贪心基准",
+  "note": "temperature 0 且无惩罚，其余全默认 —— 对照用",
+  "cfg": {
+    "engine": "hipfire",
+    "temperature": 0,
+    "repeat_penalty": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0
+  }
+}

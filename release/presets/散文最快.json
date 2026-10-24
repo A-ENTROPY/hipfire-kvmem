@@ -1,0 +1,9 @@
+{
+  "name": "散文最快",
+  "note": "dflash；还要在聊天页把 temperature 压到 0 才生效",
+  "cfg": {
+    "engine": "hipfire",
+    "hf_spec": "dflash",
+    "temperature": 0
+  }
+}

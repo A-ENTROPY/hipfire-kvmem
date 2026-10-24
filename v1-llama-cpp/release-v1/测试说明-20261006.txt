@@ -1,0 +1,81 @@
+======================================================================
+ KVMem + ROCmFP4 + DFlash2  测试说明（2026-10-06）
+======================================================================
+
+一、这个包比已发布的 v1.0.0 多了什么
+----------------------------------------------------------------------
+1. 启动器 MTP 默认草稿数 2 -> 3（Qwen 路径实测 +6.6% 英文 / +7.7% 中文）
+2. DFlash2 对 Hadamard 折叠目标的兼容修复（Bonsai 2 这类三值模型依赖它）
+3. 新工具 bin\llama-draft-vocab.exe + 实验开关 --spec-draft-vocab /
+   --spec-draft-greedy（默认关闭；实测对本机无益甚至掉速，仅作研究留档）
+4. 文档修订：长上下文解码曲线、--kvmem-budget 的「近似注意力」代价、
+   Strata --draft-vocab 的核对结论（不适用于本模型）
+5. 【重要修复】服务端跑 DFlash2 会「很慢 + 一直停不下来」的问题已修好：
+   原因是服务端只对 MTP 设置了推测解码所需的输出/回滚几何（n_rs_seq），
+   DFlash2 被漏掉，于是退回主机检查点路径 —— 每轮只要草稿没被全部接受就
+   回滚重来（不产出 token），prefill 也从毫秒级掉到 14 秒。
+   修复后（Qwen STRIX + Qwen DFlash2 草稿 n_max=3，服务端实测）：
+     decode   4.15 -> 56.17 tok/s
+     prefill  28 token 14711 ms -> 1054 ms
+     n_restore  14 -> 0
+   CLI 路径本来就没这个问题，所以之前的 CLI 实测数字不变。
+不含：Bonsai 1 的 dspark 草稿格式（比本树的 llama.cpp 新，加载不了）
+
+二、Qwen3.8-27B 路径（就是你说的「70 t/s 那个模型」）
+----------------------------------------------------------------------
+模型：Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf + mtp-Qwen3.8-27B-Q4_0.gguf
+启动：双击 start-kvmem.bat（默认组合已是最优，草稿数 3）
+改草稿数：start-kvmem.bat -DraftTokens N
+
+实测（CLI 快路径，256 token，MTP n_max=3）：
+  解码 英文 66.9 t/s / 中文 71.8 t/s（无草稿基线 43.0）
+  接受率 英文 67.7% / 中文 73.1%
+  服务端同水平（67.0-67.6，bench23 三种启动方式一致）
+预期随上下文下降：28 tok 约 67 / 1.2K 约 61 / 9K 约 59 / 27K 约 52
+
+三、Bonsai 2 27B（三值折叠 + Hadamard）测试
+----------------------------------------------------------------------
+模型（都在 G:\models\bonsai）：
+  Ternary-Bonsai-2-27B-PQ2_0.gguf             7.21 GB  主模型
+  Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf    7.66 GB  主模型 + 内嵌 MTP 头
+  Bonsai-2-27B-DFlash2-Q8_0.gguf              2.06 GB  DFlash2 草稿（训练版）
+
+！不要把 Bonsai 的文件放进 G:\KVMem\models\：启动器会把 dflash 名字的草稿
+  配给 Qwen 主模型（配错会几乎不提草稿）。用 -ModelsDir 指到单独目录。
+
+A) 最快组合：训练版 DFlash2 草稿（推荐 n_max 3；推理类可用 4）
+   start-kvmem.bat -ModelsDir G:\models\bonsai ^
+     -Model G:\models\bonsai\Ternary-Bonsai-2-27B-PQ2_0.gguf ^
+     -Draft G:\models\bonsai\Bonsai-2-27B-DFlash2-Q8_0.gguf ^
+     -Spec dflash -DraftTokens 3 -Context 32768 -Budget 32768 -Reserve 4096
+
+B) 内嵌 MTP（不需要草稿文件）
+   start-kvmem.bat -ModelsDir G:\models\bonsai ^
+     -Model G:\models\bonsai\Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf ^
+     -Spec mtp -DraftTokens 2 -Context 32768 -Budget 32768 -Reserve 4096
+   ！内嵌 MTP 时不要传 -Draft：外挂草稿会重复整个词表，净亏。
+
+实测（-c 4096，生成 128 token，三种提示词，每格 2 轮）：
+  提示词        无草稿   DFlash2(训练版)    内嵌 MTP
+  散文          49.5     63.9 (n=3)        55.8 (n=2)
+  代码          49.5     72.2 (n=3)        60.9 (n=3)
+  推理/JSON     48.9     75.9 (n=4)        70.1 (n=4)
+即 DFlash2 训练版把推理类从 49 推到 76 t/s（+55%）。
+
+四、正确性校验（建议你自己复跑）
+----------------------------------------------------------------------
+推测解码不应改变输出：同一提示词分别跑 --spec-type none 和带草稿，
+文本应逐字节相同。我们三个测试提示词的文本 md5：
+  散文 5f9b7111 / 代码 24f26590 / 推理 1b7268cb
+注意哈希口径：文件原始字节（含 CRLF/BOM）的 md5 与文本 md5 不一样，
+对比时别混用（我们踩过这个坑）。
+
+五、已知限制
+----------------------------------------------------------------------
+- 会话间速度漂移约 ±2.5%：同样工作量（如 n_drafted=140 n_accept=93）
+  实测耗时会在 1672-1762 ms 之间波动，跨时段比较请带同步基线。
+- PR #116 的 HIP vec_dot（RDNA4 上称 +37%）移植到 PQ2_0 后，在 gfx1100
+  实测输出完全一致但速度无增益，已回退。
+- 上下文「容量」免费，填满会慢：1.2K->61 / 9K->59 / 27K->52 tok/s。
+- --kvmem-budget 调小可再快约 16%，但输出变成近似（未常驻块不被注意）。
+- --threads / --flash-attn 留空即可（本版对解码无影响）。

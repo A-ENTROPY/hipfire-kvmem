@@ -1,0 +1,17 @@
+{
+  "name": "性能档",
+  "note": "【2026-10-23 之前的默认档】meanq-cosine + LRFU + GQA-max（上游 0.18 发布版配置），窗口 36864 = 288 页，不做图召回。\n实测（40 轮到 25 万 token）：解码中位 29.9 tok/s、墙钟 24.3 s —— **两档里最快**。\n代价：历史内容不在窗口里时要靠换页，问旧内容的召回比质量档慢约 38%。\n耦合：meanq-cosine ⇒ max 聚合 / 开 LRFU / 图传播 α 自动归零（引擎裁决，改 α 无效）。\n\n⚠️ 窗口 36864 是「昨天升级前」的线上值。你自己那两个深压测预设（`hipfire 256k · 分页调优（快）` / `hipfire 1M 上下文 · harness`）用的是 49152（384 页），深度远超窗口时换页更少 —— 只跑深上下文可以照它们办。**别在浅上下文放大窗口**：窗口 ≥ 深度会走「不淘汰」那条慢路（面板帮助文本 2026-10-18 实测 4.4 tok/s）。",
+  "savedAt": "2026-10-23T16:58:50+08:00",
+  "cfg": {
+    "engine": "hipfire",
+    "hf_multi_slot": true,
+    "hf_kvmem_tier": true,
+    "hf_kvmem_method": "",
+    "hf_kvmem_sink_tokens": 16384,
+    "hf_kvmem_recent_blocks": 8,
+    "hf_kvmem_query_scorer": "meanq-cosine",
+    "hf_kvmem_graph_alpha": 0,
+    "hf_kvmem_page_softmax_rows": 0,
+    "hf_kvmem_window_tokens": 36864
+  }
+}

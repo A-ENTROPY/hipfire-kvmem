@@ -1,0 +1,41 @@
+schema_version = 1
+
+[developer]
+mtp_trace = "0"
+
+[generation]
+max_tokens = 32768
+temperature = 1.0
+
+[memory]
+max_seq = 262144
+
+[memory.kvmem]
+block_tokens = 128
+cpu_bytes = 12884901888
+enabled = true
+gen_budget = 16384
+graph_alpha = 0.0
+page_softmax_rows = 0
+query_max_tokens = 512
+query_scorer = "meanq-cosine"
+recent_blocks = 8
+select_budget = 36864
+select_method = "retrieval"
+sink_blocks = 1
+sink_tokens = 16384
+trace = false
+
+[reasoning]
+max_tokens = 32768
+
+[serve]
+idle_timeout_seconds = 0
+multi_slot = true
+multi_slot_ctx = 262144
+multi_slot_slots = 1
+queue_timeout_ms = 3600000
+
+[speculation]
+mode = "mtp"
+mtp_k = 3

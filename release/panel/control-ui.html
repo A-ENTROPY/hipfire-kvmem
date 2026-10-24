@@ -1,0 +1,1107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KVMem 控制台</title>
+<style>
+/* ===========================================================================
+   设计令牌
+   方向：仪器台（instrument panel）。深色不是"默认深色"，是这台机器的实际使用
+   场景 —— 它并排开在终端旁边、盯几小时看长文吞吐。所以：低色温中性灰底、
+   单一强调色只用于"可操作/已选中"、状态色只用于状态。
+   =========================================================================== */
+:root{
+  /* 中性阶：oklch 保证明度步进均匀，逐级拉开层次 */
+  --bg:      oklch(17% 0.012 255);
+  --surface: oklch(21% 0.014 255);
+  --raised:  oklch(25% 0.016 255);
+  --sunken:  oklch(13% 0.010 255);
+  --line:    oklch(31% 0.015 255);
+  --line-2:  oklch(38% 0.016 255);
+  --ink:     oklch(94% 0.008 255);
+  --ink-2:   oklch(78% 0.012 255);
+  --ink-3:   oklch(60% 0.014 255);
+
+  /* 语义色：只有一个强调色，状态色互不混用 */
+  --accent:      oklch(72% 0.150 232);
+  --accent-ink:  oklch(18% 0.040 232);
+  --ok:          oklch(74% 0.150 158);
+  --warn:        oklch(80% 0.140 78);
+  --err:         oklch(68% 0.180 25);
+  --excl:        oklch(60% 0.020 255);
+
+  /* 字体：显示用系统 UI 变体（自带 Display 光学尺寸），数值一律等宽 + 表格数字 */
+  --font: "Segoe UI Variable Display", "Segoe UI", ui-sans-serif, system-ui, "Microsoft YaHei UI", sans-serif;
+  --mono: "Cascadia Mono", Consolas, "SF Mono", ui-monospace, monospace;
+
+  /* 字阶：为密集界面定，步进比小、靠字重和颜色分层 */
+  --t-micro: 10.5px;
+  --t-small: 12px;
+  --t-body:  13px;
+  --t-lead:  15px;
+  --t-title: 19px;
+  --t-hero:  26px;
+
+  --rail: 244px;
+  --insp: 372px;
+  --gap: 16px;
+  --radius: 10px;
+  --ease: cubic-bezier(.32,.72,0,1);
+
+  /* 间距节拍：4 的倍数，全部间距只从这一套里取。
+     散值（13px/7px/5px 混用）是"看起来不够专业"最直接的来源 —— 调研里那篇讲
+     插件界面的文章说得很直白：所有 y 坐标都落在同一节拍上，这就是为什么成熟的
+     界面"看起来很紧"，即使它们长得完全不同。 */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--ink);
+  font:var(--t-body)/1.62 var(--font);
+  font-feature-settings:"tnum" 1,"cv05" 1;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--accent);text-decoration:none}
+button,input,select,textarea{font-family:inherit;font-size:inherit;color:inherit}
+::selection{background:oklch(72% 0.150 232 / .28)}
+
+/* ---------- 布局原语：轨道 / 工作表 / 检视栏 ---------- */
+.shell{
+  display:grid;
+  /* ⚠️ 命名区域**必须是矩形**。原先是 `"brand sheet sheet" "rail sheet insp"
+     "rail bar bar"`，其中 sheet 占 (1,2)(1,3)(2,2) 是个 L 形 —— CSS 规定非矩形
+     会让**整条 grid-template-areas 作废**，于是所有子项的 grid-area 一起失效、
+     退回自动布局。而 `max-width:1379px` 那条媒体查询里的区域是合法的两列，
+     所以症状是：窗口不超过 1379 一切正常，**一旦放大越过 1380 就整页崩掉**。
+     这里补成合法的三列矩形；下面两条媒体查询同理。 */
+  /* 品牌条**通栏**：原先它只占第 1 列（= --rail = 244px），"KVMem 控制台" 与
+     副标题在那个宽度里放不下，中文就逐字折行成了竖排。顶栏本来就该通栏。 */
+  grid-template-columns:var(--rail) minmax(0,1fr) var(--insp);
+  grid-template-rows:auto minmax(0,1fr) auto;
+  grid-template-areas:"brand brand brand" "rail sheet insp" "rail bar bar";
+  min-height:100vh;
+}
+@media(max-width:1379px){
+  .shell{grid-template-columns:var(--rail) minmax(0,1fr);
+         grid-template-areas:"brand brand" "rail sheet" "rail bar"}
+  #insp{display:none}
+}
+@media(max-width:899px){
+  .shell{grid-template-columns:minmax(0,1fr);grid-template-areas:"brand" "sheet" "bar"}
+  #rail{display:none}
+}
+
+/* ---------- 品牌条 ---------- */
+.brand{
+  grid-area:brand;display:flex;align-items:center;gap:12px;
+  padding:12px 16px;border-bottom:1px solid var(--line);
+  background:var(--surface);position:sticky;top:0;z-index:30;
+}
+.mark{
+  width:26px;height:26px;border-radius:7px;flex:none;
+  background:linear-gradient(150deg,var(--accent),oklch(60% 0.16 268));
+  display:grid;place-items:center;font-weight:700;font-size:12px;
+  color:var(--accent-ink);letter-spacing:-.03em;
+}
+.brand h1{margin:0;font-size:var(--t-lead);font-weight:640;letter-spacing:-.012em}
+.brand .sub{color:var(--ink-3);font-size:var(--t-small);margin-left:2px}
+
+/* ---------- 左轨：状态 + 导航 ---------- */
+#rail{
+  grid-area:rail;border-right:1px solid var(--line);background:var(--surface);
+  padding:16px 12px 24px;position:sticky;top:57px;height:calc(100vh - 57px);
+  overflow-y:auto;overscroll-behavior:contain;
+}
+.railblock{margin-bottom:16px}
+.railtitle{
+  font-size:var(--t-micro);font-weight:700;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--ink-3);padding:0 12px 8px;
+}
+.navlink{
+  display:grid;grid-template-columns:20px 1fr auto;align-items:center;gap:8px;
+  padding:8px 12px;border-radius:7px;color:var(--ink-2);font-size:var(--t-small);
+  cursor:pointer;transition:background .12s var(--ease),color .12s var(--ease);
+  border:1px solid transparent;
+}
+.navlink:hover{background:var(--raised);color:var(--ink)}
+.navlink.on{background:oklch(72% 0.150 232 / .12);color:var(--ink);border-color:oklch(72% 0.150 232 / .32)}
+.navlink .ico{font-size:13px;text-align:center;filter:grayscale(.35)}
+.navlink.on .ico{filter:none}
+.navlink .n{font-family:var(--mono);font-size:var(--t-micro);color:var(--ink-3)}
+
+.stat{display:flex;flex-direction:column;gap:8px;padding:0 12px}
+.statrow{display:flex;align-items:baseline;gap:8px;font-size:var(--t-small)}
+.statrow .k{color:var(--ink-3);flex:none;min-width:52px}
+.statrow .v{color:var(--ink);font-family:var(--mono);font-variant-numeric:tabular-nums;
+            overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill{
+  display:inline-flex;align-items:center;gap:8px;padding:4px 8px;border-radius:999px;
+  font-size:var(--t-micro);font-weight:650;letter-spacing:.02em;
+  border:1px solid var(--line-2);color:var(--ink-2);background:var(--raised);
+}
+.pill .dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
+.pill.on{color:var(--ok);border-color:oklch(74% 0.150 158 / .42);background:oklch(74% 0.150 158 / .10)}
+.pill.off{color:var(--err);border-color:oklch(68% 0.180 25 / .42);background:oklch(68% 0.180 25 / .10)}
+.pill.wait{color:var(--warn);border-color:oklch(80% 0.140 78 / .42);background:oklch(80% 0.140 78 / .10)}
+.engine-tag{
+  display:inline-block;padding:2px 8px;border-radius:5px;font-family:var(--mono);
+  font-size:var(--t-micro);letter-spacing:.04em;text-transform:uppercase;
+  background:oklch(72% 0.150 232 / .14);color:var(--accent);border:1px solid oklch(72% 0.150 232 / .30);
+}
+.engine-tag.kvmem{background:var(--raised);color:var(--ink-3);border-color:var(--line-2)}
+
+/* ---------- 中心：参数工作表 ---------- */
+#sheet{
+  grid-area:sheet;min-width:0;padding:16px 24px 32px;
+  display:flex;flex-direction:column;gap:var(--gap);
+}
+.topbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.search{
+  flex:1;min-width:220px;max-width:420px;display:flex;align-items:center;gap:8px;
+  background:var(--sunken);border:1px solid var(--line);border-radius:8px;padding:8px 12px;
+  transition:border-color .15s var(--ease),box-shadow .15s var(--ease);
+}
+.search:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px oklch(72% 0.150 232 / .14)}
+.search input{flex:1;background:none;border:0;outline:0;font-size:var(--t-small)}
+.search input::placeholder{color:var(--ink-3)}
+.search .ic{color:var(--ink-3);font-size:12px}
+.count{font-family:var(--mono);font-size:var(--t-micro);color:var(--ink-3)}
+
+.group{margin-bottom:24px}
+.ghead{
+  display:flex;align-items:flex-end;gap:12px;padding:0 2px 8px;
+  border-bottom:1px solid var(--line);margin-bottom:2px;
+  position:sticky;top:57px;z-index:12;
+  background:linear-gradient(var(--bg) 72%,transparent);
+}
+.ghead .gi{font-size:17px;line-height:1;filter:grayscale(.2)}
+.ghead h2{margin:0;font-size:var(--t-title);font-weight:640;letter-spacing:-.018em;line-height:1.1}
+.ghead .gd{color:var(--ink-3);font-size:var(--t-small);margin-left:auto;max-width:56ch;text-align:right}
+@media(max-width:899px){.ghead .gd{display:none}}
+
+/* 行：标签 / 控件两栏，靠左对齐的阅读轴 */
+/* ---------- 生效诊断：置顶，但**不浮动** ----------
+   层次来自密度与发丝线，不来自装饰 —— 无阴影、无渐变。状态一律**静态**：
+   一根色条 + 文字，绝不闪烁。（闪烁在这个项目上是有前例的事故，见设计文档 §7。）
+   刻意**不用** position:sticky：它一直悬在内容上方会挡视线、也抢掉参数表的注意力。
+   放在工作表最上方 —— 打开就能看到，往下滚就让它走。 */
+#diag{border-bottom:1px solid var(--line);margin-bottom:var(--s4)}
+#diag:empty{display:none}
+.drow{display:grid;grid-template-columns:3px 88px minmax(0,1fr);gap:0 12px;
+      align-items:start;padding:var(--s3) 2px;border-bottom:1px solid oklch(31% 0.015 255 / .5)}
+.drow:last-child{border-bottom:0}
+.drow .stripe{width:3px;align-self:stretch;border-radius:2px;background:var(--ink-3);opacity:.55}
+.drow.ok   .stripe{background:var(--ok);opacity:1}
+.drow.warn .stripe{background:var(--warn);opacity:1}
+.drow.err  .stripe{background:var(--err);opacity:1}
+.drow .dlabel{font-family:var(--mono);font-size:var(--t-micro);letter-spacing:.09em;
+              text-transform:uppercase;color:var(--ink-3);padding-top:1px}
+.drow .dhead{color:var(--ink);font-weight:600;font-size:var(--t-small);line-height:1.5}
+.drow.err  .dhead{color:var(--err)}
+.drow.warn .dhead{color:var(--warn)}
+.drow .dwhy{color:var(--ink-3);font-size:var(--t-small);margin-top:4px;line-height:1.58;max-width:88ch}
+
+/* 分组标题的生效时机徽标。灰色是默认（要重启），只有"即时"才用强调色 ——
+   强调色要留给可操作的东西，这里"即时"是可操作的信息（改了立刻看得到）。 */
+.gbadge{font-family:var(--mono);font-size:var(--t-micro);font-weight:650;letter-spacing:.06em;
+        margin-left:auto;padding:2px 8px;border-radius:5px;white-space:nowrap;
+        border:1px solid var(--line);color:var(--ink-3);opacity:.75}
+.gbadge.live{color:var(--accent);border-color:oklch(72% 0.150 232 / .40);
+             background:oklch(72% 0.150 232 / .09);opacity:1}
+/* 分组「重置」平时不显示：它是低频且带破坏性的动作，常驻在标题行上只会抢注意力。
+   悬停或聚焦时才现身。 */
+.greset{font-family:var(--mono);font-size:var(--t-micro);letter-spacing:.04em;
+        padding:2px 8px;border-radius:5px;cursor:pointer;white-space:nowrap;
+        border:1px solid transparent;color:var(--ink-3);background:transparent;opacity:0;
+        transition:opacity .12s var(--ease),border-color .12s var(--ease),color .12s var(--ease)}
+.group:hover .greset,.greset:focus-visible{opacity:.85}
+.greset:hover{opacity:1;border-color:var(--err);color:var(--err)}
+
+/* ---------- 默认 / 自定义 两态胶囊 ----------
+   未覆盖的参数只占一行、不展开控件；点一下才变成显式值。
+   它同时解掉三件事：视觉噪声、"这值是我的还是引擎的"、以及恢复默认。 */
+.pill{font-family:var(--mono);font-size:var(--t-micro);font-weight:650;letter-spacing:.02em;
+      padding:2px 8px;border-radius:5px;cursor:pointer;white-space:nowrap;
+      border:1px solid var(--line-2);color:var(--ink-3);background:transparent;
+      transition:border-color .12s var(--ease),color .12s var(--ease)}
+.pill:hover{border-color:var(--ink-3);color:var(--ink-2)}
+.pill.on{color:var(--accent);border-color:oklch(72% 0.150 232 / .45);
+         background:oklch(72% 0.150 232 / .10)}
+
+.row{
+  display:grid;grid-template-columns:minmax(210px,272px) minmax(0,1fr);
+  gap:16px;padding:12px 2px;border-bottom:1px solid oklch(31% 0.015 255 / .5);
+  transition:background .1s var(--ease);
+}
+.row:last-child{border-bottom:0}
+.row:hover{background:oklch(25% 0.016 255 / .34)}
+.row.hide{display:none}
+/* 未覆盖的可选参数：整行只留标题 + 「默认」胶囊，控件不展开。
+   噪声降下来的同时，"这值是我的还是引擎的"变成一眼可辨。 */
+.row.def .ctl{display:none}
+.row.set .lab::after{
+  content:"";width:5px;height:5px;border-radius:50%;background:var(--accent);
+  margin-left:8px;flex:none;box-shadow:0 0 0 3px oklch(72% 0.150 232 / .16);
+}
+@media(max-width:1040px){.row{grid-template-columns:1fr;gap:8px}}
+.lab{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;
+     font-size:var(--t-body);font-weight:600;letter-spacing:-.005em;line-height:1.45}
+.lab .req{color:var(--err);font-weight:700}
+.help{color:var(--ink-3);font-size:var(--t-small);margin-top:4px;line-height:1.6;max-width:62ch}
+.help code{font-family:var(--mono);font-size:var(--t-micro);background:var(--sunken);
+           border:1px solid var(--line);padding:1px 4px;border-radius:4px;color:var(--ink-2)}
+.help b{color:var(--ink-2);font-weight:600}
+
+/* 悬浮说明：长解释的唯一去处。浮层不拦截指针，避免和控件抢焦点。 */
+.qhint{position:relative;display:inline-flex;align-items:center;justify-content:center;
+       width:14px;height:14px;border-radius:50%;flex:none;cursor:help;vertical-align:middle;
+       border:1px solid var(--line-2);color:var(--ink-3);
+       font-family:var(--mono);font-size:9px;font-weight:700;line-height:1;
+       transition:border-color .12s var(--ease),color .12s var(--ease)}
+.qhint:hover,.qhint:focus-visible{border-color:var(--accent);color:var(--accent);outline:0}
+.qhint::after{
+  content:attr(data-tip);position:absolute;left:0;top:calc(100% + 8px);z-index:40;
+  width:min(58ch,62vw);white-space:pre-wrap;text-align:left;
+  background:var(--raised);border:1px solid var(--line-2);border-radius:8px;
+  padding:var(--s3) var(--s4);color:var(--ink-2);font-weight:400;
+  font-family:var(--font);font-size:var(--t-small);line-height:1.65;letter-spacing:0;
+  opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity .1s var(--ease),visibility .1s}
+.qhint:hover::after,.qhint:focus-visible::after{opacity:1;visibility:visible}
+
+/* 内联护栏：挂在字段下方，不弹窗。跨字段规则也在这一条里出来。 */
+.errline{display:none;margin-top:var(--s2);padding-left:var(--s2);
+         border-left:2px solid var(--err);color:var(--err);
+         font-size:var(--t-small);line-height:1.55;max-width:78ch}
+.errline.on{display:block}
+
+/* 预设块：与「当前状态」同一视觉层级，不做成又一个卡片。 */
+.railblock select{width:100%;margin-bottom:var(--s2)}
+.presetbtns{display:flex;gap:var(--s1)}
+.presetbtns .btn{flex:1;padding:4px 8px;font-size:var(--t-micro)}
+.presetnote{margin-top:var(--s2);color:var(--ink-3);font-size:var(--t-micro);line-height:1.55}
+
+/* 折叠：收起后整组只留标题行 + 一行摘要。摘要走 data-sum（见 groupSummary），
+   不用"已改 N 项"这种计数——数字不告诉你改成了什么，等于没折叠。 */
+.group .ghead{cursor:pointer;user-select:none}
+.group .ghead::before{content:"▾";font-size:9px;color:var(--ink-3);margin-right:2px;
+                      transition:transform .12s var(--ease)}
+.group.collapsed .ghead::before{transform:rotate(-90deg)}
+.group.collapsed .ghead{border-bottom-color:transparent}
+.group.collapsed .row{display:none}
+.group.collapsed::after{
+  content:attr(data-sum);display:block;padding:var(--s2) 2px var(--s3);
+  font-family:var(--mono);font-size:var(--t-small);color:var(--ink-3);
+  border-bottom:1px solid var(--line);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{
+  font-size:var(--t-micro);font-weight:650;letter-spacing:.03em;padding:2px 8px;border-radius:5px;
+  border:1px solid var(--line-2);color:var(--ink-3);background:var(--raised);white-space:nowrap;
+}
+.tag.restart{color:var(--warn);border-color:oklch(80% 0.140 78 / .34);background:oklch(80% 0.140 78 / .08)}
+.tag.excl{color:var(--excl);border-color:var(--line);background:transparent}
+.ctl{min-width:0}
+.inline{display:flex;gap:8px;align-items:center}
+.inline select{flex:1;min-width:0}
+
+input[type=text],input[type=number],select,textarea{
+  width:100%;background:var(--sunken);border:1px solid var(--line);color:var(--ink);
+  padding:8px 12px;border-radius:7px;outline:0;
+  font-family:var(--mono);font-size:var(--t-small);font-variant-numeric:tabular-nums;
+  transition:border-color .14s var(--ease),box-shadow .14s var(--ease),background .14s var(--ease);
+}
+input::placeholder,textarea::placeholder{color:var(--ink-3);font-family:var(--font)}
+input[type=text]:hover,input[type=number]:hover,select:hover,textarea:hover{border-color:var(--line-2)}
+input:focus,select:focus,textarea:focus{
+  border-color:var(--accent);background:oklch(13% 0.010 255);
+  box-shadow:0 0 0 3px oklch(72% 0.150 232 / .14);
+}
+select{font-family:var(--font)}
+textarea{min-height:70px;resize:vertical;line-height:1.55}
+
+.switch{position:relative;display:inline-flex;align-items:center;gap:12px;cursor:pointer;user-select:none}
+.switch input{position:absolute;opacity:0;width:0;height:0}
+.track{
+  width:40px;height:22px;border-radius:999px;background:var(--sunken);
+  border:1px solid var(--line-2);position:relative;transition:background .18s var(--ease),border-color .18s var(--ease);
+  flex:none;
+}
+.track::after{
+  content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+  background:var(--ink-3);transition:transform .18s var(--ease),background .18s var(--ease);
+}
+.switch input:checked + .track{background:oklch(72% 0.150 232 / .26);border-color:oklch(72% 0.150 232 / .55)}
+.switch input:checked + .track::after{transform:translateX(18px);background:var(--accent)}
+.switch input:focus-visible + .track{box-shadow:0 0 0 3px oklch(72% 0.150 232 / .22)}
+.switch .sl{font-family:var(--mono);font-size:var(--t-micro);color:var(--ink-3);min-width:22px}
+.switch input:checked ~ .sl{color:var(--accent)}
+
+.btn{
+  cursor:pointer;border:1px solid var(--line-2);background:var(--raised);color:var(--ink-2);
+  padding:8px 12px;border-radius:7px;font-size:var(--t-small);font-weight:550;
+  transition:background .14s var(--ease),border-color .14s var(--ease),color .14s var(--ease);
+  white-space:nowrap;
+}
+.btn:hover{background:oklch(30% 0.016 255);color:var(--ink);border-color:oklch(45% 0.018 255)}
+.btn:active{transform:translateY(.5px)}
+.btn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:650}
+.btn.primary:hover{background:oklch(78% 0.140 232);border-color:oklch(78% 0.140 232)}
+.btn.quiet{background:transparent;border-color:transparent;color:var(--ink-3)}
+.btn.quiet:hover{background:var(--raised);color:var(--ink);border-color:var(--line)}
+.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.btn.mini{padding:4px 8px;font-size:var(--t-micro)}
+
+/* ---------- 右：检视栏（实况命令行 / 日志） ---------- */
+#insp{
+  grid-area:insp;border-left:1px solid var(--line);background:var(--surface);
+  padding:16px 12px;position:sticky;top:57px;height:calc(100vh - 57px);overflow-y:auto;
+}
+.iblock + .iblock{margin-top:16px}
+.ihead{
+  display:flex;align-items:center;gap:8px;margin-bottom:8px;
+  font-size:var(--t-micro);font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:var(--ink-3);
+}
+.ihead .sp{flex:1}
+pre.term{
+  margin:0;background:var(--sunken);border:1px solid var(--line);border-radius:8px;
+  padding:12px 12px;font-family:var(--mono);font-size:var(--t-micro);line-height:1.72;
+  white-space:pre-wrap;word-break:break-word;color:var(--ink-2);
+  max-height:44vh;overflow:auto;
+}
+pre.term.nowrap{white-space:pre;overflow-x:auto}
+pre.term .e{color:var(--ok)}
+pre.term .n{color:var(--warn)}
+pre.term .c{color:var(--ink-3)}
+
+/* ---------- 底部动作条 ---------- */
+#bar{
+  grid-area:bar;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:12px 24px;border-top:1px solid var(--line);background:var(--surface);
+  position:sticky;bottom:0;z-index:25;
+}
+#bar .sp{flex:1}
+.hint{color:var(--ink-3);font-size:var(--t-micro);max-width:52ch}
+
+/* ---------- 提示 ---------- */
+#toast{position:fixed;right:20px;bottom:76px;z-index:200;display:flex;flex-direction:column;gap:8px;
+       max-width:min(460px,92vw)}
+.msg{
+  padding:12px 16px;border-radius:9px;background:var(--raised);border:1px solid var(--line-2);
+  box-shadow:0 10px 30px oklch(0% 0 0 / .5);font-size:var(--t-small);
+  animation:pop .2s var(--ease);white-space:pre-wrap;line-height:1.6;
+}
+.msg.ok{border-color:oklch(74% 0.150 158 / .5)}
+.msg.err{border-color:oklch(68% 0.180 25 / .55)}
+.msg.warn{border-color:oklch(80% 0.140 78 / .5)}
+@keyframes pop{from{opacity:0;transform:translateY(8px)}}
+@keyframes sp{to{transform:rotate(360deg)}}
+.spin{display:inline-block;width:11px;height:11px;border:2px solid oklch(74% 0.150 158 / .3);
+      border-top-color:var(--ok);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="brand">
+    <span class="mark">KV</span>
+    <h1>KVMem 控制台</h1>
+    <span class="sub">/ 推理服务参数与进程</span>
+    <span style="flex:1"></span>
+    <span class="pill" id="badge"><span class="dot"></span>检测中…</span>
+  </header>
+
+  <aside id="rail">
+    <div class="railblock">
+      <div class="railtitle">当前状态</div>
+      <div class="stat" id="stat"></div>
+    </div>
+    <div class="railblock">
+      <div class="railtitle">预设</div>
+      <select id="presetSel"></select>
+      <div class="presetbtns">
+        <button class="btn mini" id="btnPresetApply">应用</button>
+        <button class="btn mini quiet" id="btnPresetSave">存为…</button>
+        <button class="btn mini quiet" id="btnPresetDel">删除</button>
+      </div>
+      <div class="presetnote" id="presetNote"></div>
+    </div>
+    <div class="railblock">
+      <div class="railtitle">配置快照</div>
+      <select id="snapSel"></select>
+      <div class="presetbtns">
+        <button class="btn mini quiet" id="btnSnapRestore">回滚到这一份</button>
+      </div>
+      <div class="presetnote">每次保存前自动存一份，保留最近 5 份。</div>
+    </div>
+    <div class="railblock">
+      <div class="railtitle">参数分组</div>
+      <div id="nav"></div>
+    </div>
+  </aside>
+
+  <main id="sheet">
+    <div class="topbar">
+      <label class="search">
+        <span class="ic">⌕</span>
+        <input type="text" id="q" placeholder="搜索参数（名称 / 说明 / 命令行旗标）" autocomplete="off" />
+        <span class="sr">搜索参数</span>
+      </label>
+      <span class="count" id="qcount"></span>
+      <span style="flex:1"></span>
+      <label class="switch" title="显示标注为「高级」的参数">
+        <input type="checkbox" id="advTog" />
+        <span class="track"></span>
+        <span class="sl">高级</span>
+      </label>
+    </div>
+    <div id="diag"></div>
+    <div id="form"></div>
+  </main>
+
+  <aside id="insp">
+    <div class="iblock">
+      <div class="ihead">等效命令行<span class="sp"></span>
+        <button class="btn mini quiet" id="btnCopyCmd">复制</button>
+      </div>
+      <pre class="term nowrap" id="cmdText">加载中…</pre>
+    </div>
+    <div class="iblock">
+      <div class="ihead">服务日志<span class="sp"></span>
+        <button class="btn mini quiet" id="btnLogRefresh">刷新</button>
+      </div>
+      <pre class="term" id="logText">点「查看日志」加载…</pre>
+    </div>
+  </aside>
+
+  <div id="bar">
+    <button class="btn primary" id="btnApply">保存并重启生效</button>
+    <button class="btn" id="btnSave">仅保存</button>
+    <button class="btn" id="btnRestart">重启</button>
+    <button class="btn" id="btnStart">启动服务</button>
+    <button class="btn" id="btnStop">停止服务</button>
+    <a href="#" id="btnChat" target="_blank" rel="noopener"><button class="btn">打开聊天界面</button></a>
+    <button class="btn quiet" id="btnLog">查看日志</button>
+    <button class="btn quiet" id="btnCmd">查看命令行</button>
+    <span class="sp"></span>
+    <span class="hint" id="hint">参数在进程启动时读取，改完需「保存并重启生效」。</span>
+    <button class="btn quiet" id="btnReset">恢复本机默认</button>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const API = location.origin;
+let SCHEMA = [], DEFAULTS = {}, CFG = {}, EXCLUSIVE = {};
+let SHOW_ADV = false, QUERY = '', ENGINE = 'kvmem';
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ALL = () => SCHEMA.flatMap((g) => g.params);
+const byId = (id) => ALL().find((p) => p.id === id);
+
+function toast(text, kind = 'ok', ms = 3600) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + kind;
+  d.textContent = text;
+  $('#toast').appendChild(d);
+  setTimeout(() => d.remove(), ms);
+}
+
+async function api(path, opts) {
+  const r = await fetch(API + path, opts);
+  const t = await r.text();
+  let j; try { j = JSON.parse(t); } catch { j = { raw: t }; }
+  j.__status = r.status;
+  return j;
+}
+
+// ---------- 左轨 ----------
+function renderNav() {
+  $('#nav').innerHTML = SCHEMA.map((g) => `
+    <div class="navlink" data-go="g_${g.group}">
+      <span class="ico">${g.icon}</span>
+      <span>${esc(g.title)}</span>
+      <span class="n">${g.params.length}</span>
+    </div>`).join('');
+  document.querySelectorAll('[data-go]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const t = document.getElementById(el.dataset.go);
+      if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+}
+
+// ---------- 表单 ----------
+// 引擎互斥：hipfire 是当前引擎时，这些参数在 hipfire 上没有对应物（或已由别的
+// 参数承担）。**禁止输入 + 给出理由**，而不是藏起来 —— 藏起来用户会以为功能没了。
+function isExcluded(id) { return ENGINE === 'hipfire' && Object.prototype.hasOwnProperty.call(EXCLUSIVE, id); }
+
+function fieldHtml(p) {
+  const raw = CFG[p.id];
+  const val = raw === undefined || raw === null ? '' : raw;
+  const id = 'f_' + p.id;
+  const def = DEFAULTS[p.id];
+  const excl = isExcluded(p.id);
+  const dirty = JSON.stringify(raw) !== JSON.stringify(def) &&
+                !(raw === '' && (def === undefined || def === null || def === ''));
+  const dis = excl ? ' disabled' : '';
+
+  let control = '';
+  if (p.type === 'bool') {
+    control = `<label class="switch"><input type="checkbox" id="${id}" data-id="${p.id}" ${val === true ? 'checked' : ''}${dis}/>
+      <span class="track"></span><span class="sl">${val === true ? '开' : '关'}</span></label>`;
+  } else if (p.type === 'model' || p.type === 'mmproj' || p.type === 'hfmodel' || p.type === 'hfdraft') {
+    const ph = p.type === 'model' ? '主模型 GGUF 完整路径'
+             : p.type === 'hfmodel' ? 'hipfire 主模型 HFQM 完整路径'
+             : p.type === 'hfdraft' ? 'hipfire 草稿头 (.hfq) 完整路径'
+             : '留空则为纯文本模式';
+    control = `<div class="inline">
+        <select id="sel_${p.id}" data-id="${p.id}" data-sel="1"${dis}></select>
+        <button class="btn mini" data-browse="${p.id}"${dis}>扫描</button>
+      </div>
+      <input type="text" id="${id}" data-id="${p.id}" value="${esc(val)}" style="margin-top:8px"
+             placeholder="${ph}"${dis} />`;
+  } else if (p.type === 'select') {
+    const opts = (p.options || []).map((o) =>
+      `<option value="${esc(o)}" ${String(val) === String(o) ? 'selected' : ''}>${esc(o)}</option>`).join('');
+    control = `<select id="${id}" data-id="${p.id}"${dis}>${
+      p.optional ? `<option value="" ${val === '' ? 'selected' : ''}>（留空，用服务端默认）</option>` : ''
+    }${opts}</select>`;
+  } else if (p.type === 'int' || p.type === 'float') {
+    const step = p.step ?? (p.type === 'int' ? 1 : 0.01);
+    control = `<input type="number" id="${id}" data-id="${p.id}" value="${esc(val)}" step="${step}"
+                 ${p.min !== undefined ? `min="${p.min}"` : ''} ${p.max !== undefined ? `max="${p.max}"` : ''}
+                 placeholder="${p.optional ? '留空 = 服务端默认' : ''}"${dis} />`;
+  } else if (p.id === 'chat_template') {
+    control = `<textarea id="${id}" data-id="${p.id}" rows="3" placeholder="留空使用模型自带模板"${dis}>${esc(val)}</textarea>`;
+  } else {
+    control = `<input type="text" id="${id}" data-id="${p.id}" value="${esc(val)}"
+                 placeholder="${p.optional ? '留空 = 服务端默认' : ''}"${dis} />`;
+  }
+
+  // 正文只留"这个值对应哪个键、默认是多少"——一眼要用到的。
+  // 长解释全部移到悬浮提示。调研里那篇讲插件工艺的文章说得直白：界面看起来是
+  // crafted 还是 vibe-coded，很大一部分差别就在这里。几百字摊在正文，整页就散了。
+  const tipText = String(p.help || '').replace(/<[^>]+>/g, '').trim();
+  const defTxt = (def !== undefined && def !== '' && def !== null)
+    ? `默认 <code>${esc(p.type === 'bool' ? (def ? '开' : '关') : def)}</code>` : '';
+  // 值域上墙：数值字段直接写出引擎接受的范围，用户不用去翻源码或等报错。
+  const rangeTxt = (p.min !== undefined || p.max !== undefined)
+    ? `范围 <code>${p.min !== undefined ? p.min : '−∞'}–${p.max !== undefined ? p.max : '+∞'}</code>` : '';
+  const inline = excl
+    ? `<b>hipfire 下不适用：</b>${esc(EXCLUSIVE[p.id])}`
+    : [p.flag ? `<code>${esc(p.flag)}</code>` : '', rangeTxt, defTxt].filter(Boolean).join(' · ');
+
+  const tags = (excl ? `<span class="tag excl">引擎互斥</span>` : '') +
+               (p.required ? `<span class="req">*必填</span>` : '');
+
+  // 可选字段的「默认 / 自定义」两态：留空 = 用服务端默认，此时不展开控件。
+  // 见设计文档 §6.1(a) —— 这个模式把"我覆盖了没有"做成了界面上的状态，
+  // 而不是要用户记住的事。
+  const atDefault = !!p.optional && (raw === '' || raw === null || raw === undefined);
+  const pill = p.optional
+    ? `<button class="pill${atDefault ? '' : ' on'}" data-pill="${p.id}"
+               title="${atDefault ? '当前使用服务端默认值，点击改为自定义' : '当前为自定义值，点击恢复默认'}">${atDefault ? '默认' : '自定义'}</button>`
+    : '';
+
+  return `<div class="row${p.advanced ? ' advrow' : ''}${dirty ? ' set' : ''}${excl ? ' excl' : ''}${atDefault ? ' def' : ''}"
+       data-adv="${p.advanced ? 1 : 0}" data-search="${esc((p.id + ' ' + (p.label || '') + ' ' + (p.help || '') + ' ' + (p.flag || '')).toLowerCase())}"
+       id="row_${p.id}">
+    <div>
+      <div class="lab">${esc(p.label)} ${tags}${pill}${
+        tipText ? `<span class="qhint" tabindex="0" data-tip="${esc(tipText)}" aria-label="参数说明">?</span>` : ''}</div>
+      <div class="help">${inline}</div>
+      <div class="errline" data-err="${p.id}"></div>
+    </div>
+    <div class="ctl">${control}</div>
+  </div>`;
+}
+
+// 两态胶囊：点击在「默认 / 自定义」之间切，并把值清空或聚焦控件。
+// 用委托监听，免得在每个控件的 change 处理器里都插一段。
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-pill]');
+  if (!b) return;
+  const id = b.dataset.pill;
+  const row = document.getElementById('row_' + id);
+  if (!row) return;
+  const toDefault = !row.classList.contains('def');
+  row.classList.toggle('def', toDefault);
+  b.classList.toggle('on', !toDefault);
+  b.textContent = toDefault ? '默认' : '自定义';
+  b.title = toDefault ? '当前使用服务端默认值，点击改为自定义' : '当前为自定义值，点击恢复默认';
+  const ctl = row.querySelector('[data-id]');
+  if (toDefault) {
+    // 恢复默认 = 把值清空（留空即"不写这个键"）。不能只藏控件，
+    // 否则用户以为恢复了、实际还把旧值发出去。
+    if (CFG[id] !== undefined && CFG[id] !== '') { CFG[id] = (typeof CFG[id] === 'boolean') ? false : ''; }
+    row.classList.remove('set');
+    if (ctl) { if (ctl.type === 'checkbox') ctl.checked = false; else ctl.value = ''; }
+  } else if (ctl) {
+    ctl.focus();
+  }
+});
+// 反过来：在「默认」态下直接给控件填了值（比如下拉选了一个），要把胶囊翻成自定义。
+document.addEventListener('change', (e) => {
+  const ctl = e.target.closest('[data-id]');
+  if (!ctl) return;
+  const row = ctl.closest('.row');
+  if (!row || !row.classList.contains('def')) return;
+  const b = row.querySelector('[data-pill]');
+  if (!b) return;
+  const v = ctl.type === 'checkbox' ? ctl.checked : ctl.value;
+  if (v === '' || v === null || v === undefined) return;
+  row.classList.remove('def');
+  b.classList.add('on');
+  b.textContent = '自定义';
+});
+
+// ---------- 分组折叠 ----------
+// 折叠状态记忆在 localStorage —— 折叠某组是"这组我不常动"的表达，刷新就丢会让人重复劳动。
+const COLLAPSED = (() => {
+  try { return new Set(JSON.parse(localStorage.getItem('kvmem.collapsed') || '[]')); }
+  catch { return new Set(); }
+})();
+
+// 折叠时显示的关键值摘要：取该组里**非默认**的项，最多 3 条。
+// 不用"已改 N 项"这种计数 —— 数字不告诉你改成了什么，等于没折叠。
+function groupSummary(groupKey) {
+  const g = SCHEMA.find((x) => x.group === groupKey);
+  if (!g) return '';
+  const changed = g.params.filter((p) => {
+    const cur = CFG[p.id], def = DEFAULTS[p.id];
+    return !(JSON.stringify(cur) === JSON.stringify(def) ||
+             (cur === '' && (def === undefined || def === null || def === '')));
+  });
+  if (!changed.length) return '全部为默认值';
+  const shown = changed.slice(0, 3).map((p) => {
+    const v = CFG[p.id];
+    const txt = p.type === 'bool' ? (v ? '开' : '关')
+              : (v === '' || v === null || v === undefined) ? '默认' : String(v);
+    return `${p.label}=${txt.length > 16 ? txt.slice(0, 15) + '…' : txt}`;
+  });
+  return shown.join(' · ') + (changed.length > 3 ? ` · 另 ${changed.length - 3} 项` : '');
+}
+
+function refreshSummaries() {
+  for (const g of SCHEMA) {
+    const sec = document.getElementById('g_' + g.group);
+    if (sec) sec.dataset.sum = groupSummary(g.group);
+  }
+}
+
+// ---------- 预设 ----------
+// 应用 = 合并进表单**但不落盘**：用户要的是"先看一眼再决定"，直接写 config.json
+// 会让人没法核对。落盘仍然走「保存并重启生效」。
+let PRESETS = [];
+async function loadPresets() {
+  try { PRESETS = (await api('/api/presets')).presets || []; } catch { PRESETS = []; }
+  const sel = $('#presetSel');
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">（选择预设）</option>' +
+    PRESETS.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
+  if (keep && PRESETS.some((p) => p.name === keep)) sel.value = keep;
+  showPresetNote();
+}
+const currentPreset = () => PRESETS.find((p) => p.name === $('#presetSel').value);
+function showPresetNote() {
+  const p = currentPreset();
+  const el = $('#presetNote');
+  if (!p) { el.textContent = ''; return; }
+  const r = p.restartCount || 0;
+  el.innerHTML = esc(p.note || '') +
+    (r ? `<br><span style="color:var(--warn)">其中 ${r} 项需重启引擎</span>` : '');
+}
+async function applyPreset() {
+  const p = currentPreset();
+  if (!p) return toast('先在上面选一个预设', 'warn');
+  Object.assign(CFG, p.cfg || {});
+  renderForm();                       // 值、胶囊、摘要、护栏一起重画
+  const r = p.restartCount || 0;
+  toast(`已套用「${p.name}」${r ? `，其中 ${r} 项要重启引擎才生效` : ''} —— 核对后点「保存并重启生效」`,
+        r ? 'warn' : 'ok', 7000);
+}
+async function savePresetAs() {
+  const name = window.prompt('预设名（例如：长文 128k / 快速对话）', '');
+  if (!name || !name.trim()) return;
+  try {
+    await api('/api/presets', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ name: name.trim(), cfg: CFG }) });
+    await loadPresets();
+    $('#presetSel').value = name.trim();
+    showPresetNote();
+    toast(`已存为预设「${name.trim()}」`, 'ok');
+  } catch (e) { toast(`保存预设失败：${e.message}`, 'err'); }
+}
+async function deletePreset() {
+  const p = currentPreset();
+  if (!p) return toast('先选一个预设', 'warn');
+  if (!window.confirm(`删除预设「${p.name}」？这只是删掉这套组合，不影响当前配置。`)) return;
+  await api('/api/presets/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                     body: JSON.stringify({ name: p.name }) });
+  await loadPresets();
+  toast(`已删除「${p.name}」`, 'ok');
+}
+
+// ---------- 配置快照 ----------
+async function loadSnapshots() {
+  let list = [];
+  try { list = (await api('/api/snapshots')).snapshots || []; } catch {}
+  $('#snapSel').innerHTML = list.length
+    ? list.map((s) => `<option value="${esc(s.file)}">${esc(s.file.replace(/^config-|\.json$/g, ''))}</option>`).join('')
+    : '<option value="">（还没有快照）</option>';
+  $('#btnSnapRestore').disabled = !list.length;
+}
+async function restoreSnapshot() {
+  const file = $('#snapSel').value;
+  if (!file) return;
+  if (!window.confirm(`回滚到 ${file}？\n\n当前配置会先被自动存成一份新快照，所以这次回滚本身也能撤回。`)) return;
+  try {
+    const r = await api('/api/snapshots/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                    body: JSON.stringify({ file }) });
+    CFG = r.config; renderForm(); await loadSnapshots(); await refreshCmd(); refreshStatus();
+    toast('已回滚。重启引擎后生效。', 'ok', 5000);
+  } catch (e) { toast(`回滚失败：${e.message}`, 'err'); }
+}
+
+// ---------- 内联护栏 ----------
+// 保存时才报错太晚：用户改完五个参数点保存、被打回来，还得自己翻是哪一条。
+// 这里把**同一套**规则（后端 validateConfig，经 /api/validate 下发）提前到输入时。
+// 加 180ms 去抖 —— 逐字符打字时不该每次都打一趟后端。
+let errTimer = null;
+async function paintErrors() {
+  let r;
+  try { r = await api('/api/validate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(CFG),
+  }); } catch { return; }
+  document.querySelectorAll('.errline').forEach((el) => { el.textContent = ''; el.classList.remove('on'); });
+  for (const e of (r.errors || [])) {
+    const el = document.querySelector(`.errline[data-err="${e.id}"]`);
+    if (el) { el.textContent = e.message; el.classList.add('on'); }
+  }
+  const n = (r.errors || []).length;
+  const bar = $('#hint');
+  if (bar && n) bar.innerHTML = `<span style="color:var(--err)">${n} 处配置有问题，保存会被拒绝。</span>`;
+}
+function scheduleErrors() { clearTimeout(errTimer); errTimer = setTimeout(paintErrors, 180); }
+
+function renderForm() {
+  $('#form').innerHTML = SCHEMA.map((g) => {
+    const basic = g.params.filter((p) => !p.advanced);
+    const adv = g.params.filter((p) => p.advanced);
+    return `<section class="group" id="g_${g.group}">
+      <div class="ghead">
+        <span class="gi">${g.icon}</span>
+        <h2>${esc(g.title)}</h2>
+        <span class="gd">${esc(g.desc || '')}</span>
+        <span class="gbadge ${g.live ? 'live' : ''}">${g.live ? '即时生效' : '重启生效'}</span>
+        <button class="greset" data-greset="${g.group}" title="把这一组恢复为官方默认值">重置</button>
+      </div>
+      ${basic.map(fieldHtml).join('')}
+      ${adv.length ? adv.map(fieldHtml).join('') : ''}
+    </section>`;
+  }).join('');
+
+  document.querySelectorAll('[data-id]').forEach((el) => {
+    const id = el.dataset.id;
+    const p = byId(id);
+    const ev = (el.type === 'checkbox' || el.tagName === 'SELECT') ? 'change' : 'input';
+    el.addEventListener(ev, () => {
+      if (p && p.type === 'bool') CFG[id] = el.checked;
+      else if (p && p.type === 'int') CFG[id] = el.value === '' ? '' : parseInt(el.value, 10);
+      else if (p && p.type === 'float') CFG[id] = el.value === '' ? '' : parseFloat(el.value);
+      else CFG[id] = el.value;
+      if (p && p.type === 'bool') { const sl = el.parentElement.querySelector('.sl'); if (sl) sl.textContent = el.checked ? '开' : '关'; }
+      if (p && (p.type === 'model' || p.type === 'mmproj' || p.type === 'hfmodel' || p.type === 'hfdraft')) {
+        const sel = document.getElementById('sel_' + id);
+        if (sel) sel.value = el.value;
+      }
+      markDirty(id);
+      scheduleErrors();
+      if (id === 'engine') switchEngine(el.value);
+    });
+  });
+  document.querySelectorAll('[data-sel]').forEach((sel) => {
+    sel.addEventListener('change', () => {
+      const id = sel.dataset.id;
+      const inp = document.getElementById('f_' + id);
+      if (inp) inp.value = sel.value;
+      CFG[id] = sel.value;
+      markDirty(id);
+      scheduleErrors();
+    });
+  });
+  document.querySelectorAll('[data-browse]').forEach((b) => {
+    b.addEventListener('click', () => loadModels(b.dataset.browse));
+  });
+  applyFilter();
+  // 分组折叠：标题整行可点。折叠状态记忆在 localStorage —— 用户折叠某组是
+  // "这组我不常动"的表达，刷新就丢会让人重复劳动。
+  document.querySelectorAll('.ghead').forEach((h) => {
+    const sec = h.closest('.group');
+    if (!sec) return;
+    if (COLLAPSED.has(sec.id)) sec.classList.add('collapsed');
+    h.addEventListener('click', () => {
+      sec.classList.toggle('collapsed');
+      if (sec.classList.contains('collapsed')) COLLAPSED.add(sec.id); else COLLAPSED.delete(sec.id);
+      try { localStorage.setItem('kvmem.collapsed', JSON.stringify([...COLLAPSED])); } catch {}
+    });
+    // 「重置」按钮在标题行**里面**，所以要在它自己身上 stopPropagation ——
+    // 委托到 document 再拦已经晚了，标题行的折叠会先跑。
+    const rb = h.querySelector('[data-greset]');
+    if (rb) rb.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const g = SCHEMA.find((x) => x.group === rb.dataset.greset);
+      if (!g) return;
+      if (!window.confirm(`把「${g.title}」恢复为官方默认值？\n\n只影响这一组，且仍需点保存才落盘。`)) return;
+      for (const p of g.params) {
+        if (DEFAULTS[p.id] !== undefined) CFG[p.id] = DEFAULTS[p.id];
+        else if (p.optional) CFG[p.id] = '';
+      }
+      renderForm();
+      toast(`「${g.title}」已恢复默认 —— 核对后点保存`, 'ok', 5000);
+    });
+  });
+  scheduleErrors();
+  refreshSummaries();
+}
+
+function markDirty(id) {
+  const row = document.getElementById('row_' + id);
+  if (!row) return;
+  const def = DEFAULTS[id], cur = CFG[id];
+  const same = JSON.stringify(cur) === JSON.stringify(def) || (cur === '' && (def === undefined || def === null || def === ''));
+  row.classList.toggle('set', !same);
+  // 摘要跟着值走：折叠着的那一组也要能看出"里面改成了什么"。
+  refreshSummaries();
+}
+
+// 切引擎要**立刻**重画互斥态，不然用户要把这一栏改完、重启，才发现它根本没生效。
+function switchEngine(v) {
+  ENGINE = String(v || 'kvmem') === 'hipfire' ? 'hipfire' : 'kvmem';
+  renderForm();
+  refreshCmd();
+}
+
+function applyFilter() {
+  const q = QUERY.trim().toLowerCase();
+  let shown = 0;
+  document.querySelectorAll('.group').forEach((sec) => {
+    let any = 0;
+    sec.querySelectorAll('.row').forEach((r) => {
+      const adv = r.dataset.adv === '1';
+      const hitQ = !q || (r.dataset.search || '').includes(q);
+      const hitAdv = !adv || SHOW_ADV || (q && hitQ);
+      const show = hitQ && hitAdv;
+      r.classList.toggle('hide', !show);
+      if (show) { any++; shown++; }
+    });
+    sec.style.display = any ? '' : 'none';
+  });
+  $('#qcount').textContent = (q || SHOW_ADV) ? `${shown} / ${ALL().length} 项` : '';
+}
+
+async function loadModels(which) {
+  const m = await api('/api/models');
+  const id = which || 'model';
+  const sel = document.getElementById('sel_' + id);
+  if (!sel) return;
+  const list = id === 'mmproj' ? (m.mmproj || [])
+             : id === 'hfmodel' ? (m.hf || [])
+             : id === 'hfdraft' ? (m.hfdraft || [])
+             : (m.main || []);
+  const kindCn = id === 'mmproj' ? '视觉投影器' : id === 'hfmodel' ? 'hipfire 主模型'
+              : id === 'hfdraft' ? 'hipfire 草稿头' : '主模型';
+  sel.innerHTML = `<option value="">（点击右侧"扫描"选择）</option>` + list.map((x) =>
+    `<option value="${esc(x.path)}">${esc(x.name)} — ${x.mb} MB</option>`).join('');
+  if (!list.length) {
+    toast(id === 'hfmodel' || id === 'hfdraft'
+      ? 'J:\\hipfiremodels 下没有找到 HFQM 文件'
+      : 'models 目录下没有找到 .gguf 文件', 'warn');
+    return;
+  }
+  sel.value = CFG[id] || '';
+  toast(`已扫描到 ${list.length} 个${kindCn}`, 'ok');
+}
+
+// ---------- 状态 ----------
+// ---------- 生效诊断 ----------
+// 面板过去只保证"参数发出去了"，从不区分它生效没有 —— 这一轮踩的三个坑
+// （分层没跑、准入被拒、投机被关）全在那一层之后，保存时的校验永远抓不到。
+// 数据来自引擎自己的日志，不是猜的；详细规则见 kvmem-control.mjs effectDiagnostics。
+async function renderDiagnostics() {
+  let d;
+  try { d = await api('/api/diagnose'); } catch { return; }
+  const weight = { err: 0, warn: 1, ok: 2, off: 3 };
+  const rows = (d.rows || []).slice()
+    .sort((a, b) => (weight[a.state] ?? 9) - (weight[b.state] ?? 9));
+  $('#diag').innerHTML = rows.map((r) => `
+    <div class="drow ${esc(r.state)}">
+      <span class="stripe"></span>
+      <span class="dlabel">${esc(r.label)}</span>
+      <div>
+        <div class="dhead">${esc(r.headline)}</div>
+        <div class="dwhy">${esc(r.detail)}</div>
+      </div>
+    </div>`).join('');
+}
+
+async function refreshStatus() {
+  const s = await api('/api/status');
+  const b = $('#badge');
+  if (s.starting) { b.className = 'pill wait'; b.innerHTML = '<span class="spin"></span>正在加载模型…'; }
+  else if (s.running) { b.className = 'pill on'; b.innerHTML = '<span class="dot"></span>运行中'; }
+  else { b.className = 'pill off'; b.innerHTML = '<span class="dot"></span>已停止'; }
+
+  const eng = (CFG.engine === 'hipfire') ? 'hipfire' : 'kvmem';
+  const rows = [
+    ['引擎', `<span class="engine-tag ${eng === 'kvmem' ? 'kvmem' : ''}">${esc(eng)}</span>`],
+    ['模型', `<span class="v" title="${esc(s.model || '')}">${esc((s.model || '—').split(/[\\/]/).pop())}</span>`],
+    ['端口', `<span class="v">${s.port}</span>`],
+  ];
+  if (s.pid) rows.push(['PID', `<span class="v">${s.pid}</span>`]);
+  if (s.running && s.uptimeSec) rows.push(['已运行', `<span class="v">${s.uptimeSec}s</span>`]);
+  $('#stat').innerHTML = rows.map(([k, v]) => `<div class="statrow"><span class="k">${k}</span>${v}</div>`).join('');
+
+  $('#hint').innerHTML = s.kvmemInfo
+    ? `运行参数：<code>${esc(s.kvmemInfo)}</code>`
+    : (s.lastError ? `<span style="color:var(--err)">${esc(s.lastError)}</span>`
+                   : '参数在进程启动时读取，改完需「保存并重启生效」。');
+  $('#btnChat').href = s.chatUrl;
+  // 诊断依赖引擎状态，所以跟着状态一起刷。不 await：日志解析比状态慢，
+  // 不该拖住状态那条链（状态是按钮态与提示文案的输入）。
+  renderDiagnostics();
+  return s;
+}
+
+// ---------- 动作 ----------
+async function save() { return api('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(CFG) }); }
+
+// 把服务端逐条的人话错误显示出来。只 toast 一句"保存失败"等于把用户扔在原地。
+function showErrors(r) {
+  if (r && Array.isArray(r.errors) && r.errors.length) {
+    toast(r.errors.map((e) => '· ' + e.message).join('\n'), 'err', 12000);
+  } else {
+    toast(r && r.error ? r.error : '操作失败', 'err', 9000);
+  }
+}
+
+async function apply() {
+  document.querySelectorAll('button').forEach((x) => (x.disabled = true));
+  const b = $('#badge'); b.className = 'pill wait';
+  b.innerHTML = '<span class="spin"></span>正在重启并加载模型…';
+  toast('正在保存配置并重启服务，加载模型约需 30–60 秒…', 'warn', 9000);
+  const r = await api('/api/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(CFG) });
+  document.querySelectorAll('button').forEach((x) => (x.disabled = false));
+  if (r.ok) { toast('配置已保存并生效，服务已就绪。', 'ok', 6000); await loadCfgAndRedraw(); }
+  else { showErrors(r); await showLog(); }
+  refreshStatus();
+}
+
+async function doRestart() {
+  toast('正在重启服务…', 'warn', 5000);
+  const r = await api('/api/restart', { method: 'POST' });
+  toast(r.ok ? '服务已重启并就绪' : '重启失败，请查看右侧日志', r.ok ? 'ok' : 'err', 6000);
+  refreshStatus();
+}
+
+async function showLog() {
+  const r = await api('/api/log?tail=200');
+  $('#logText').textContent = r.log || '（暂无日志）';
+  $('#logText').scrollTop = $('#logText').scrollHeight;
+}
+
+async function showCmd() { await refreshCmd(); $('#insp').scrollIntoView({ behavior: 'smooth' }); }
+
+async function refreshCmd() {
+  const r = await api('/api/command');
+  const t = $('#cmdText');
+  t.textContent = r.command || '';
+  // 只给高亮的行加色，不改文本内容（复制出去必须是纯命令）
+  t.innerHTML = esc(r.command || '')
+    .replace(/^(#.*)$/gm, '<span class="c">$1</span>')
+    .replace(/(HIPFIRE_[A-Z0-9_]+)/g, '<span class="e">$1</span>');
+}
+
+async function loadCfgAndRedraw() {
+  CFG = await api('/api/config');
+  ENGINE = String(CFG.engine || 'kvmem') === 'hipfire' ? 'hipfire' : 'kvmem';
+  renderForm();
+}
+
+async function init() {
+  const sc = await api('/api/schema');
+  SCHEMA = sc.groups; DEFAULTS = sc.defaults || {}; EXCLUSIVE = sc.exclusive || {};
+  CFG = await api('/api/config');
+  ENGINE = String(CFG.engine || 'kvmem') === 'hipfire' ? 'hipfire' : 'kvmem';
+  renderNav();
+  renderForm();
+  await loadPresets();
+  await loadSnapshots();
+  $('#btnSnapRestore').addEventListener('click', restoreSnapshot);
+  $('#presetSel').addEventListener('change', showPresetNote);
+  $('#btnPresetApply').addEventListener('click', applyPreset);
+  $('#btnPresetSave').addEventListener('click', savePresetAs);
+  $('#btnPresetDel').addEventListener('click', deletePreset);
+  await refreshCmd();
+  await refreshStatus();
+  await showLog();
+  // 分组高亮跟随滚动
+  const links = [...document.querySelectorAll('.navlink')];
+  const io = new IntersectionObserver((es) => {
+    es.forEach((e) => {
+      if (!e.isIntersecting) return;
+      links.forEach((l) => l.classList.toggle('on', l.dataset.go === e.target.id));
+    });
+  }, { rootMargin: '-60px 0px -70% 0px' });
+  document.querySelectorAll('.group').forEach((s) => io.observe(s));
+}
+
+$('#q').addEventListener('input', (e) => { QUERY = e.target.value; applyFilter(); });
+$('#advTog').addEventListener('change', (e) => { SHOW_ADV = e.target.checked; applyFilter(); });
+$('#btnApply').onclick = apply;
+$('#btnSave').onclick = async () => {
+  const r = await save();
+  if (r.ok) { toast('配置已保存到 config.json（重启后才生效）', 'ok'); await loadCfgAndRedraw(); }
+  else showErrors(r);
+};
+$('#btnRestart').onclick = doRestart;
+$('#btnStart').onclick = async () => {
+  toast('正在启动服务…', 'warn', 5000);
+  const r = await api('/api/start', { method: 'POST' });
+  if (r.ok) toast('服务已启动', 'ok', 6000); else showErrors(r);
+  refreshStatus();
+};
+$('#btnStop').onclick = async () => {
+  if (!confirm('确定要停止服务吗？')) return;
+  await api('/api/stop', { method: 'POST' });
+  toast('服务已停止', 'warn'); refreshStatus();
+};
+$('#btnLog').onclick = showLog;
+$('#btnLogRefresh').onclick = showLog;
+$('#btnCmd').onclick = showCmd;
+$('#btnCopyCmd').onclick = async () => {
+  try { await navigator.clipboard.writeText($('#cmdText').textContent); toast('命令行已复制', 'ok', 2000); }
+  catch { toast('复制失败，请手动选中', 'warn'); }
+};
+$('#btnReset').onclick = async () => {
+  if (!confirm('恢复为本机推荐默认值？当前修改将丢失（需点"保存并重启生效"才会真正生效）。')) return;
+  const r = await api('/api/reset', { method: 'POST' });
+  CFG = r.config; ENGINE = String(CFG.engine || 'kvmem') === 'hipfire' ? 'hipfire' : 'kvmem';
+  renderForm(); await refreshCmd(); toast('已恢复默认值', 'ok');
+};
+
+init();
+setInterval(refreshStatus, 4000);
+</script>
+</body>
+</html>

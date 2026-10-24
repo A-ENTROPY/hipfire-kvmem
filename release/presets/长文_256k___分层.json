@@ -1,0 +1,16 @@
+{
+  "name": "长文 256k + 分层",
+  "note": "单槽 264064 上下文 / 窗口 36864 / 池 40960；需重启",
+  "cfg": {
+    "engine": "hipfire",
+    "hf_spec": "dflash",
+    "hf_multi_slot": true,
+    "hf_multi_slot_slots": 1,
+    "hf_multi_slot_ctx": 264064,
+    "hf_kvmem_tier": true,
+    "hf_kvmem_window_tokens": 36864,
+    "hf_kvmem_pool_tokens": 40960,
+    "hf_prefix_cache": true,
+    "hf_max_seq": 262144
+  }
+}

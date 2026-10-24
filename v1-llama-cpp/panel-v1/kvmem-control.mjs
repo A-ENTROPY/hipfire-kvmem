@@ -151,15 +151,15 @@ const SCHEMA = [
   },
   {
     group: 'mtp', title: '推测解码加速（MTP / DFlash2）', icon: '⚡',
-    desc: '两种加速方式二选一。MTP：用主模型自带的 nextn 头（模型名带 -mtp）。DFlash2：用独立草稿模型（块扩散并行草稿）。本机实测：无加速 39.2 t/s、DFlash2(n=3) 49.8 t/s（+27%）、MTP2 37.5 t/s。',
+    desc: '两种加速方式二选一。MTP：用主模型自带的 nextn 头（模型名带 -mtp），或配 sidecar MTP 草稿模型。DFlash2：用独立 DFlash2 草稿模型（块扩散并行草稿）。本机实测（RX 7900 XTX，n=64）：无加速 43.8 t/s、MTP 78.7 t/s（+79%）、DFlash2 56.0 t/s（+28%）。MTP 明显更快，优先用 MTP。',
     params: [
       { id: 'spec_type', flag: '--spec-type', label: '推测解码模式', type: 'select', default: 'draft-mtp',
         options: ['none', 'draft-mtp', 'draft-dflash'],
-        help: 'none = 关闭；draft-mtp = 用主模型自带的 MTP 头（需模型名带 -mtp）；draft-dflash = 用独立 DFlash2 草稿模型（需在下面选草稿模型）。' },
-      { id: 'model_draft', flag: '--model-draft', short: '-md', label: 'DFlash2 草稿模型', type: 'model', optional: true,
-        help: '仅 draft-dflash 模式需要。选 Qwen3.8-27B-DFlash2-*.gguf，例如 Q4_K_M（1.09 GB）。留空则 MTP 不需要。' },
+        help: 'none = 关闭；draft-mtp = 用主模型自带的 nextn 头（模型名带 -mtp），或在下面选一个 mtp-*.gguf 作独立草稿；draft-dflash = 用独立 DFlash2 草稿模型（需在下面选草稿模型）。' },
+      { id: 'model_draft', flag: '--model-draft', short: '-md', label: '草稿模型（sidecar drafter）', type: 'model', optional: true,
+        help: '两种模式都能用，但必须配对：draft-dflash 选 Qwen3.8-27B-DFlash2-*.gguf（Q4_K_M，1.09 GB）；draft-mtp 选 mtp-*.gguf（Q4_0，1.56 GB），实测比用主模型自带 nextn 头更快（78.7 vs 71.7 t/s）。留空则 draft-mtp 回落到焊接 nextn 头。选错配对会被自动忽略。' },
       { id: 'spec_draft_n_max', flag: '--spec-draft-n-max', label: '草稿 token 数', type: 'int', default: 3, min: 1,
-        help: '每步预测几个 token。实测：DFlash2 用 3 最佳（49.8 t/s）；用 7 会因接受率降低（37%→19%）而回落到 39.6 t/s。MTP 用 2。' },
+        help: '每步预测几个 token。最优值取决于草稿来源（取值过大会因接受率下降而变慢）：焊接 MTP 用 2（71.7 t/s）、sidecar MTP 用 4（78.7 t/s）、DFlash2 用 5（56.0 t/s）。' },
       { id: 'spec_kv_dtype', flag: '--spec-kv-dtype', label: '草稿 KV 类型（仅 MTP）', type: 'select', default: 'f16',
         options: ['f16', 'q8_0', 'q5_0', 'q4_0'], help: 'MTP 草稿模型的 KV 精度。官方配方用 f16。DFlash2 不需要此项。' },
       { id: 'spec_draft_p_min', flag: '--spec-draft-p-min', label: '草稿最低概率', type: 'float', optional: true, default: 0, min: 0, max: 1, step: 0.05,
@@ -204,7 +204,7 @@ const SCHEMA = [
       { id: 'chat_template_kwargs', flag: '--chat-template-kwargs', label: '模板参数 (JSON)', type: 'string', optional: true,
         help: '传给对话模板的默认参数，例如 {"enable_thinking":true}。需为合法 JSON。' },
       { id: 'chat_template_file', flag: '--chat-template-file', label: '自定义模板文件', type: 'string', optional: true,
-        help: '加载自定义 Jinja 模板文件路径。留空用模型自带模板。', advanced: true },
+        help: '加载自定义 Jinja 模板文件路径。留空用模型自带模板。⚠ 已知故障：ROCmFP4 模型在 server 路径下会输出乱码或空回复（基线同样复现，与本机加速无关）。把此项指向一个内容为 {{ messages[0][\'content\'] }} 的单行模板文件即可规避，且不影响 MTP 加速。', advanced: true },
       { id: 'chat_template', flag: '--chat-template', label: '内联模板内容', type: 'string', optional: true,
         help: '直接写 Jinja 模板文本，一般用不到。', advanced: true },
     ],
@@ -273,16 +273,19 @@ function defaultConfig() {
   const autoMain  = pickFromModels((f) => !isMmproj(f) && !/dflash|eagle|draft/i.test(f) && !/^mtp[-_]/i.test(f),
                                    ['ROCMFP4', 'IQ3_S-mtp', 'IQ3', '27B', '.*']);
   const autoDraft = pickFromModels((f) => /dflash/i.test(f), ['Q4_K_M', 'Q8_0', 'BF16', '.*']);
+  const autoMtpDraft = pickFromModels((f) => /^mtp[-_]/i.test(path.basename(f)), ['Q4_0', 'Q8_0', '.*']);
   const autoMmp   = pickFromModels(isMmproj, ['BF16', 'Q5', '.*']);
   for (const p of ALL_PARAMS) {
     if (p.type === 'bool') cfg[p.id] = p.default ?? false;
     else if (p.id === 'model')       cfg[p.id] = autoMain  || path.join(modelDir, 'Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf');
-    else if (p.id === 'model_draft') cfg[p.id] = autoDraft;
+    else if (p.id === 'model_draft') cfg[p.id] = autoMtpDraft || autoDraft;
     else if (p.type === 'mmproj')    cfg[p.id] = autoMmp   || '';
     else cfg[p.id] = p.optional ? (p.default ?? '') : (p.default ?? '');
   }
-  // 有草稿模型时默认开启 DFlash2
-  if (autoDraft) { cfg.spec_type = 'draft-dflash'; cfg.spec_draft_n_max = 3; }
+  // MTP 实测远快于 DFlash2（+79% vs +28%），有 MTP 草稿就优先用 MTP。
+  // n_max 最优值随草稿来源不同：sidecar MTP 用 4、DFlash2 用 5。
+  if (autoMtpDraft)   { cfg.spec_type = 'draft-mtp';    cfg.spec_draft_n_max = 4; }
+  else if (autoDraft) { cfg.spec_type = 'draft-dflash'; cfg.spec_draft_n_max = 5; }
   return cfg;
 }
 // ---------------------------------------------------------------------------
@@ -316,10 +319,13 @@ function buildArgs(cfg) {
     const v = cfg[p.id];
     if (v === undefined || v === null || v === '') continue;
 
-    // The sidecar drafter path is meaningful only for draft-dflash. Passing it in
-    // MTP mode makes the MTP init try to open the drafter GGUF and fail.
+    // Sidecar drafter: usable by BOTH modes, but the pairing must match.
+    // draft-dflash wants a DFlash2 GGUF; draft-mtp wants an mtp-* GGUF.
+    // Handing the wrong one to the drafter init makes it fail to load.
     if (p.id === 'model_draft') {
-      if (isDflash) args.push('--model-draft', String(v));
+      const base = String(v).split(/[\\/]/).pop() || '';
+      const looksMtp = /^mtp[-_]/i.test(base);
+      if (isDflash ? !looksMtp : looksMtp) args.push('--model-draft', String(v));
       continue;
     }
     // MTP-only knobs are meaningless for a sidecar drafter.

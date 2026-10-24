@@ -18,6 +18,7 @@ param(
     [string]$GpuTarget = 'gfx1100',
     [string]$OutDir    = '',
     [string]$UiSource  = '',
+    [string[]]$ExtraExe = @('llama-quantize.exe','llama-kvmem-cli.exe'),
     [switch]$Lite,
     [switch]$KeepStage
 )
@@ -34,6 +35,14 @@ $bin   = Join-Path $stage 'bin'
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 
 Copy-Item $exe $bin -Force
+
+# Extra executables. The docs tell users to quantize with the bundled
+# llama-quantize, so it must be inside the package too.
+foreach ($x in $ExtraExe) {
+    $src = Join-Path $BuildDir "bin/$x"
+    if (Test-Path $src) { Copy-Item $src $bin -Force; Write-Host "附带可执行文件: $x" }
+    else { Write-Warning "未找到 $x（说明文档有引用，建议补上）" }
+}
 
 if (-not $Lite) {
     if (-not (Test-Path (Join-Path $RocmPath 'bin/amdhip64_7.dll'))) {
@@ -64,6 +73,7 @@ $panelDst = Join-Path $stage 'panel'
 New-Item -ItemType Directory -Force -Path $panelDst | Out-Null
 Copy-Item (Join-Path $repoRoot 'panel/*') $panelDst -Force -Recurse
 Copy-Item (Join-Path $repoRoot 'release/读我用我.txt')     $stage -Force -ErrorAction SilentlyContinue
+Copy-Item (Join-Path $repoRoot 'release/测试说明-20261006.txt') $stage -Force -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $repoRoot 'LICENSE')                  $stage -Force
 Copy-Item (Join-Path $repoRoot 'README.md')                $stage -Force
 Copy-Item (Join-Path $repoRoot 'THIRD_PARTY_NOTICES.md')   $stage -Force

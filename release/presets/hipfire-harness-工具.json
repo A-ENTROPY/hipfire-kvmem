@@ -1,0 +1,21 @@
+{
+    "name":  "hipfire 1M 上下文 · harness",
+    "note":  "1M max_seq + 常驻窗口 49152（384 页）+ sink 16384 + q8 + MTP K=2。实测显存 20.67 GiB（plan 16.77 + delta 3.89），远低于 26 GB 上限。历史超过 49k 的部分走分层近似注意力。⚠️ 不要放大窗口：256k 窗口实测 prefill 只有 200 tok/s（49k 窗口是 982），且 256k+asym4 会顶到显存回落。需重启。",
+    "cfg":  {
+                "engine":  "hipfire",
+                "hf_multi_slot":  true,
+                "hf_multi_slot_slots":  1,
+                "hf_multi_slot_ctx":  1000000,
+                "hf_max_seq":  1000000,
+                "hf_kvmem_tier":  true,
+                "hf_kvmem_window_tokens":  49152,
+                "hf_kvmem_pool_tokens":  "",
+                "hf_kvmem_sink_tokens":  16384,
+                "hf_kvmem_cpu_gb":  24,
+                "hf_kv_cache":  "q8",
+                "hf_prefix_cache":  false,
+                "hf_idle_timeout":  0,
+                "hf_mtp_k":  2,
+                "hf_mtp_ngram":  "on"
+            }
+}

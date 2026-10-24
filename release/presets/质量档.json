@@ -1,0 +1,17 @@
+{
+  "name": "质量档",
+  "note": "【2026-10-23 起】page-softmax + 单跳图召回 α=0.2 + 窗口 44032 = 344 页（仍留 137 空槽）。\n实测（同深度同脚本、只换问题指向）：**问开头（旧内容）12.2 → 19.6 tok/s，+61%**；浅深度 35.1 → 38.1；代价是深上下文每步多读 13% 的 KV，40 轮解码中位 26.0、墙钟 28.5 s。\n两档稳定性同量级：40/40 成功、0 退化、0 错误；答案长度差异落在采样噪声内（738 vs 673–774）。\n耦合：page-softmax ⇒ 均值聚合 / 关 LRFU / α=0.2（α 填 0 在这一档会被解释成 0.2）。\n\n⚠️ 44032（344 页）是我今天按受控 A/B 实测选的：浅深度 6 轮与深到 25 万都验过；池子会随窗口自动扩（425 → 481 页，显存计划 17.33 / 23.98 GiB，余 3.92）。只跑深上下文时可以提到你们自己的 49152（384 页）；同上，**浅上下文别放大**。",
+  "savedAt": "2026-10-23T16:58:50+08:00",
+  "cfg": {
+    "engine": "hipfire",
+    "hf_multi_slot": true,
+    "hf_kvmem_tier": true,
+    "hf_kvmem_method": "",
+    "hf_kvmem_sink_tokens": 16384,
+    "hf_kvmem_recent_blocks": 8,
+    "hf_kvmem_query_scorer": "page-softmax",
+    "hf_kvmem_graph_alpha": 0.2,
+    "hf_kvmem_page_softmax_rows": 0,
+    "hf_kvmem_window_tokens": 44032
+  }
+}

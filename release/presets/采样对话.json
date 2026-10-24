@@ -1,0 +1,10 @@
+{
+  "name": "采样对话",
+  "note": "temperature 0.7；注意投机解码会被引擎关闭",
+  "cfg": {
+    "engine": "hipfire",
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "top_k": 20
+  }
+}

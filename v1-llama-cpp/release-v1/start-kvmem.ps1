@@ -4,15 +4,16 @@
 #  最简单的用法：把模型丢进 models\ 目录，然后双击 start-kvmem.bat
 #
 #  脚本会自动：
-#    1) 扫描 models\ 目录，识别「主模型 / DFlash2 草稿 / 视觉投影器」
-#    2) 自动组合最优配置（有 DFlash2 就用 DFlash2，否则退 MTP，再否则关加速）
+#    1) 扫描 models\ 目录，识别「主模型 / 草稿模型 / 视觉投影器」
+#    2) 自动组合最优配置（有 mtp-* 草稿就用 MTP，否则 DFlash2，再否则用主模型自带的 MTP 头）
 #    3) 没有模型时，打印下载清单和链接后退出
 #
 #  常用参数（都可省略）：
 #     -ModelsDir <目录>     模型目录（默认 .\models）
 #     -Model <文件>         手动指定主模型
-#     -Draft <文件>         手动指定 DFlash2 草稿模型
+#     -Draft <文件>         手动指定草稿模型（DFlash2 或 mtp-*）
 #     -Spec auto|dflash|mtp|none   加速方式（默认 auto）
+#     -DraftTokens <n>      草稿 token 数（0=按加速方式自动取推荐值）
 #     -List                 只列出扫描结果，不启动
 #     -DryRun               只打印将执行的命令，不启动
 # ============================================================================
@@ -27,7 +28,7 @@ param(
     [int]$Budget       = 36864,
     [int]$Reserve      = 32768,
     [int]$MaxTokens    = 16384,
-    [int]$DraftTokens  = 3,
+    [int]$DraftTokens  = 0,
     [string]$KvDtype   = 'q8_0',
     [string]$Device    = 'ROCm0',
     [int]$Port         = 18200,
@@ -60,17 +61,23 @@ function Show-DownloadHelp {
     Write-Host ''
     if ($Missing -contains 'main') {
         Write-Host '  【必需】主模型（二选一）' -ForegroundColor White
-        Write-Host '    1) 推荐：速度最快，配合 DFlash2' -ForegroundColor Green
+        Write-Host '    1) 推荐：速度最快，配合 MTP 草稿（实测 68 tok/s）' -ForegroundColor Green
         Write-Host '       Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf' -ForegroundColor Cyan
-        Write-Host '       来源：ROCmFP4 项目的量化产物' -ForegroundColor Gray
-        Write-Host '             https://github.com/charlie12345/rocmfp4-llama' -ForegroundColor DarkGray
+        Write-Host '       下载（本机实测用的就是这一份）：' -ForegroundColor Gray
+        Write-Host '             https://huggingface.co/kingjones777/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF/resolve/main/Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf' -ForegroundColor DarkGray
+        Write-Host '       国内镜像：把 huggingface.co 换成 hf-mirror.com' -ForegroundColor Gray
         Write-Host '    2) 备选：KVMem 官方配方，自带 MTP 头' -ForegroundColor Green
         Write-Host '       Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf     （11.29 GB）' -ForegroundColor Cyan
         Write-Host '       下载：https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF' -ForegroundColor DarkGray
     }
     if ($Missing -contains 'draft') {
         Write-Host ''
-        Write-Host '  【推荐】DFlash2 草稿模型（实测再快 24%）' -ForegroundColor White
+        Write-Host '  【首选】MTP 草稿模型（实测再快 45%）' -ForegroundColor White
+        Write-Host '       mtp-Qwen3.8-27B-Q4_0.gguf             （1.28 GB）' -ForegroundColor Cyan
+        Write-Host '       下载：https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/MTP/mtp-Qwen3.8-27B-Q4_0.gguf' -ForegroundColor DarkGray
+        Write-Host '       国内镜像：https://hf-mirror.com/unsloth/Qwen3.8-27B-GGUF/resolve/main/MTP/mtp-Qwen3.8-27B-Q4_0.gguf' -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Host '  【备选】DFlash2 草稿模型（实测再快 26%）' -ForegroundColor White
         Write-Host '       Qwen3.8-27B-DFlash2-Q4_K_M.gguf       （1.06 GB）' -ForegroundColor Cyan
         Write-Host '       下载：https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF' -ForegroundColor DarkGray
         Write-Host '       国内镜像：https://hf-mirror.com/incoai/Qwen3.8-27B-DFlash2-GGUF' -ForegroundColor DarkGray
@@ -114,12 +121,17 @@ function Pick-Main($list) {
 }
 
 $pickMain   = if ($Model)  { Get-Item $Model  -ErrorAction SilentlyContinue } else { Pick-Main $nMain }
-# 草稿模型：优先 DFlash2（取体积最小的，通常是 Q4_K_M，最快）
-$pickDraft  = if ($Draft)  { Get-Item $Draft  -ErrorAction SilentlyContinue } else {
-    $d = $nDraft | Where-Object { $_.Name -match 'dflash' } | Sort-Object Length | Select-Object -First 1
-    if (-not $d) { $d = $nDraft | Sort-Object Length | Select-Object -First 1 }
-    $d
-}
+# 草稿模型按加速方式选：mtp-* 是 sidecar MTP（实测 63.1 t/s，首选），dflash 是 DFlash2（54.6 t/s）
+# 同类里取体积最小的（通常是 Q4，最快）
+$draftMtp  = $nDraft | Where-Object { $_.Name -match '^mtp[-_]' } | Sort-Object Length | Select-Object -First 1
+$draftDf   = $nDraft | Where-Object { $_.Name -match 'dflash' } | Sort-Object Length | Select-Object -First 1
+$draftAny  = $nDraft | Sort-Object Length | Select-Object -First 1
+$pickDraft = if ($Draft) { Get-Item $Draft -ErrorAction SilentlyContinue }
+             elseif ($Spec -eq 'dflash') { if ($draftDf)  { $draftDf }  else { $draftMtp } }
+             elseif ($Spec -eq 'mtp')    { if ($draftMtp) { $draftMtp } else { $draftDf } }
+             elseif ($draftMtp) { $draftMtp }
+             elseif ($draftDf)  { $draftDf }
+             else { $draftAny }
 $pickMmproj = if ($Mmproj) { Get-Item $Mmproj -ErrorAction SilentlyContinue } else { $nMmproj | Sort-Object Length -Descending | Select-Object -First 1 }
 
 Write-Host ''
@@ -158,27 +170,37 @@ if ($List) {
 }
 
 # ---------------------------------------------------------- 加速方式 ----
-$hasDraft   = $null -ne $pickDraft
-$mainHasMtp = $pickMain.Name -match '\-mtp|mtp\-'
+$hasDraft    = $null -ne $pickDraft
+$mainHasMtp  = $pickMain.Name -match '\-mtp|mtp\-'
+$draftIsMtp  = $hasDraft -and ($pickDraft.Name -match '^mtp[-_]')
 $effectiveSpec = $Spec
 $notice = @()
 switch ($Spec) {
     'auto' {
-        if ($hasDraft)        { $effectiveSpec = 'dflash' }
-        elseif ($mainHasMtp)  { $effectiveSpec = 'mtp';  $notice += '未找到 DFlash2 草稿模型，自动改用主模型自带的 MTP 加速' }
-        else                  { $effectiveSpec = 'none'; $notice += '未找到 DFlash2 草稿模型，且主模型不含 MTP 头，已关闭推测解码' }
+        if ($draftIsMtp)      { $effectiveSpec = 'mtp' }
+        elseif ($hasDraft)    { $effectiveSpec = 'dflash' }
+        elseif ($mainHasMtp)  { $effectiveSpec = 'mtp';  $notice += '未找到独立草稿模型，改用主模型自带的 MTP 头' }
+        else                  { $effectiveSpec = 'none'; $notice += '未找到草稿模型，且主模型不含 MTP 头，已关闭推测解码' }
     }
     'dflash' {
-        if (-not $hasDraft) {
-            $notice += '指定了 dflash 但没找到草稿模型，已自动降级'
+        if (-not ($hasDraft -and -not $draftIsMtp)) {
+            $notice += '指定了 dflash 但没有可用的 DFlash2 草稿模型，已自动降级'
             if ($mainHasMtp) { $effectiveSpec = 'mtp';  $notice += '-> 改用 MTP' }
             else             { $effectiveSpec = 'none'; $notice += '-> 关闭推测解码' }
         }
     }
     'mtp' {
-        if (-not $mainHasMtp) { $notice += '主模型文件名不含 -mtp，可能没有内置 MTP 头；若启动失败请改用 -Spec none' }
+        if (-not $draftIsMtp -and -not $mainHasMtp) {
+            $effectiveSpec = 'none'
+            $notice += '主模型不含 MTP 头，也没有 mtp-* 草稿模型，已关闭推测解码'
+        }
     }
 }
+
+# 草稿 token 数：0 = 按来源取本机实测最优值（MTP 与 DFlash2 都是 3）
+$nMax = if ($DraftTokens -gt 0) { $DraftTokens }
+        elseif ($effectiveSpec -eq 'dflash') { 3 }
+        else { 3 }
 
 # ---------------------------------------------------------------- 拼参数 ----
 $exeArgs = @(
@@ -189,7 +211,7 @@ $exeArgs = @(
     '--kvmem', '--kvmem-budget', "$Budget", '--kvmem-gen-reserve', "$Reserve"
     '--kv-dtype', $KvDtype
     '--enable-thinking', '--reasoning-budget', '8192'
-    # 注意：不要加 --threads 0 / --flash-attn on —— 两者都会让速度腰斩
+    # 注意：不要加 --threads 0 / --flash-attn on —— 旧版会腰斩，本版无收益
 )
 if (-not $NoWebui) {
     if (Test-Path (Join-Path $uiDir 'index.html')) { $exeArgs += @('--webui', '--ui-dir', $uiDir) }
@@ -200,8 +222,12 @@ if (-not $NoWebui) {
 if ($pickMmproj) { $exeArgs += @('--mmproj', $pickMmproj.FullName, '--no-mmproj-offload', '--image-max-tokens', '512') }
 
 switch ($effectiveSpec) {
-    'dflash' { $exeArgs += @('--spec-type', 'draft-dflash', '-md', $pickDraft.FullName, '--spec-draft-n-max', "$DraftTokens") }
-    'mtp'    { $exeArgs += @('--spec-type', 'draft-mtp', '--spec-draft-n-max', '2', '--spec-kv-dtype', 'f16', '--kvmem-mtp-state', 'replay') }
+    'dflash' { $exeArgs += @('--spec-type', 'draft-dflash', '-md', $pickDraft.FullName, '--spec-draft-n-max', "$nMax") }
+    'mtp'    {
+        $exeArgs += @('--spec-type', 'draft-mtp')
+        if ($draftIsMtp) { $exeArgs += @('-md', $pickDraft.FullName) }
+        $exeArgs += @('--spec-draft-n-max', "$nMax", '--spec-kv-dtype', 'f16', '--kvmem-mtp-state', 'replay')
+    }
     'none'   { }
 }
 
@@ -209,14 +235,19 @@ switch ($effectiveSpec) {
 Write-Host ''
 Write-Host '   将使用:' -ForegroundColor White
 Write-Host ("      主模型   : {0}" -f $pickMain.Name) -ForegroundColor Cyan
-if ($effectiveSpec -eq 'dflash') { Write-Host ("      草稿模型 : {0}" -f $pickDraft.Name) -ForegroundColor Cyan }
+if ($effectiveSpec -ne 'none' -and $hasDraft) { Write-Host ("      草稿模型 : {0}" -f $pickDraft.Name) -ForegroundColor Cyan }
 if ($pickMmproj) { Write-Host ("      视觉投影 : {0}" -f $pickMmproj.Name) -ForegroundColor Cyan }
-$specText = switch ($effectiveSpec) { 'dflash' { 'DFlash2（推荐，实测 +24%）' } 'mtp' { 'MTP' } default { '关闭' } }
+$specText = switch ($effectiveSpec) {
+    'dflash' { "DFlash2（实测 +59%，草稿 $nMax）" }
+    'mtp'    { if ($draftIsMtp) { "MTP sidecar（实测 +56%，草稿 $nMax）" } else { "MTP 焊接头（实测 +29%，草稿 $nMax）" } }
+    default  { '关闭' }
+}
 Write-Host ("      加速方式 : {0}" -f $specText) -ForegroundColor Cyan
 Write-Host ("      上下文   : {0}   检索窗口: {1}   单轮上限: {2}" -f $Context, $Budget, $Reserve) -ForegroundColor Gray
 foreach ($n in $notice) { Write-Host ("      [!] {0}" -f $n) -ForegroundColor Yellow }
-if ($effectiveSpec -ne 'dflash' -and -not $hasDraft) {
-    Write-Host '      [i] 把 DFlash2 草稿模型放进 models\ 可再提速约 24%：' -ForegroundColor Green
+if (-not $hasDraft) {
+    Write-Host '      [i] 把草稿模型放进 models\ 可再提速 26%~45%（mtp-*.gguf 最快）：' -ForegroundColor Green
+    Write-Host '          https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/MTP/mtp-Qwen3.8-27B-Q4_0.gguf' -ForegroundColor DarkGray
     Write-Host '          https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF' -ForegroundColor DarkGray
 }
 

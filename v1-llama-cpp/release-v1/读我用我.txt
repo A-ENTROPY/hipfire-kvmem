@@ -8,7 +8,7 @@
       （下载清单见 models\把模型放这里.md）
    3) 双击 start-kvmem.bat
 
- 脚本会自动扫描 models\、识别主模型/DFlash2草稿/视觉投影器、
+ 脚本会自动扫描 models\、识别主模型/草稿模型/视觉投影器、
  自动组合最优配置并启动。浏览器打开 http://127.0.0.1:18200/
 
 ------------------------------------------------------------------------
@@ -16,11 +16,23 @@
 ------------------------------------------------------------------------
  【必需】主模型（二选一）
    1) 推荐  Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf       13.75 GB
-            来源：https://github.com/charlie12345/rocmfp4-llama
+            配合下面的 MTP 草稿，实测 英文 66.9 / 中文 71.8 tok/s（本机最快组合，草稿数 3）
+            直接下载（本机实测用的就是这一份，SHA256 已核对）：
+            https://huggingface.co/kingjones777/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF/resolve/main/Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf
+            国内镜像：
+            https://hf-mirror.com/kingjones777/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF/resolve/main/Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf
+            （想自己量化也行：本包自带 llama-quantize，预设名 Q4_0_ROCMFP4_STRIX，
+              格式来自 https://github.com/charlie12345/rocmfp4-llama ）
    2) 备选  Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf        11.29 GB
+            模型自带 MTP 焊接头，不需要草稿模型，实测 58 tok/s
             https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF
 
- 【推荐】DFlash2 草稿模型（实测再快 24%）
+ 【首选】MTP 草稿模型（实测再快 56%/67%，配合上面的 1) 使用；中文对话接受率更高）
+           mtp-Qwen3.8-27B-Q4_0.gguf                   1.28 GB
+           https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/MTP/mtp-Qwen3.8-27B-Q4_0.gguf
+           国内镜像：https://hf-mirror.com/unsloth/Qwen3.8-27B-GGUF/resolve/main/MTP/mtp-Qwen3.8-27B-Q4_0.gguf
+
+ 【备选】DFlash2 草稿模型（英文实测再快 59%，与 MTP 草稿打平）
            Qwen3.8-27B-DFlash2-Q4_K_M.gguf             1.06 GB
            https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF
            国内镜像：https://hf-mirror.com/incoai/Qwen3.8-27B-DFlash2-GGUF
@@ -56,6 +68,7 @@
    -ModelsDir "D:\models" 模型放在别的目录
    -Spec none             关闭推测解码（最省显存）
    -Spec mtp              强制用 MTP
+   -DraftTokens 2         手动指定草稿数（0 = 自动；推荐 MTP 用 2 / DFlash2 用 3）
    -Context 32768         小上下文，省显存
    -Reserve 131072        允许更长的单轮输出（更费显存）
 
@@ -63,12 +76,23 @@
  性能提示（实测于 RX 7900 XTX / gfx1100 / ROCm 7.2）
 ------------------------------------------------------------------------
  * 启动器默认【不传】 --threads 与 --flash-attn：
-   实测 --threads 0 让解码 51.5 -> 26.6 tok/s，
-        --flash-attn on 让 52.0 -> 29.3 tok/s。
-   千万不要手动加这两项。
- * DFlash2 草稿数用 3 最佳（-DraftTokens 3）；5/7 反而更慢。
- * 实测：原生 38.8 tok/s -> DFlash2 48.1 tok/s（+24%），
-   峰值（3 秒窗口）53.0 tok/s；256K 上下文几乎没有速度惩罚。
+    旧版（v0.16/9-27 构建）加这两项会让速度腰斩，本版重测已无影响（±0.7%）。
+    仍然建议留空 —— 没有收益，且留空就是启动器与面板的默认值。
+ * 草稿数用 3 最佳（MTP 与 DFlash2 都是 3）。
+   2026-10-05 交替 A/B：MTP 英文/中文 n2 = 62.8/66.7 → n3 = 66.9/71.8（+6.6%/+7.7%）。
+   加到 4 反而更慢（英文掉到 57.8）。
+ * 实测解码（同一台机器，生成 256 token，MTP3/DFlash3）：
+     ROCmFP4 主模型 原生              43.0 tok/s
+     ROCmFP4 + MTP 草稿（首选）       英文 66.9 / 中文 71.8 tok/s   +56%
+     ROCmFP4 + DFlash2（备选）        英文 68.4 tok/s   +59%
+     IQ3_S 主模型 原生                45.1 tok/s
+     IQ3_S + 自带 MTP 焊接头          58.2 tok/s   +29%
+   MTP 接受率：英文 67.7% / 中文 73.1%（KVMEM_PERF=1 时打印 KVMEM_SPEC_STATS）。
+ * 长提示词（约 5.4K token）预填充约 800~950 tok/s；短提示词（约 1K）读数偏低（610~625）属正常预热。
+ * 上下文「容量」免费（256K 可分配），但填满的上下文会慢：
+   1.2K 提示词 ≈61 tok/s，9K ≈59，27K ≈52（MTP3，服务端预热后）。
+   把 --kvmem-budget 调小（如 8192）可再提速约 16%，但输出变成近似（未常驻块不被注意）；
+   要正确输出请保持 budget ≥ 提示词长度。
  * 单轮生成长度受 -Reserve（--kvmem-gen-reserve）限制，含思考内容。
 
 ------------------------------------------------------------------------

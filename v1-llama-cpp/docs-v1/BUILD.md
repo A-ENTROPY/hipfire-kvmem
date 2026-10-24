@@ -82,5 +82,5 @@ git init; git apply ..\patches\llama-kvmem-current.patch
 | `invalid ggml type 101` | 你用了**上游原版** llama.cpp 加载 ROCmFP4 模型；必须用本仓库的构建 |
 | `MTP draft context is null` | 模型没有内置 nextn 头，却用了 `--spec-type draft-mtp`；改用 `draft-dflash` + `-md` |
 | `--spec-type draft-dflash requires --model-draft` | 忘传草稿模型；加 `-md <dflash.gguf>` |
-| 速度只有一半 | 检查是否加了 `--threads 0` 或 `--flash-attn on` —— 两者都会腰斩速度 |
+| 速度只有一半 | 检查是否加了 `--threads 0` 或 `--flash-attn on`。旧版会腰斩，本版实测已无影响（±0.7%），留空即可 |
 | `deploy` 报错/无输出 | 确认 `llama.cpp` 子目录已打上 KVMem 补丁（存在 `src/llama-kvmem-factory.h`） |

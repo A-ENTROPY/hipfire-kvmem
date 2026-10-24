@@ -1,0 +1,21 @@
+{
+    "name":  "hipfire 256k · 分页调优（快）",
+    "note":  "解码优先。窗口 49152（384 页）/ 池留空=引擎按窗口自动定尺（498 页 2.3 GiB）/ q8 / sink 6000 / 单槽 264000。2026-10 实测（MTP K=2）：decode 37–50 tok/s、prefill 0.75–0.98k tok/s、200+ 请求 0 个 503。不动草稿引擎——要复现我的 decode 数字请把推测解码切成 mtp。窗口/池改动需重启。",
+    "cfg":  {
+                "engine":  "hipfire",
+                "hf_multi_slot":  true,
+                "hf_multi_slot_slots":  1,
+                "hf_multi_slot_ctx":  264000,
+                "hf_max_seq":  264000,
+                "hf_kvmem_tier":  true,
+                "hf_kvmem_pool_tokens":  "",
+                "hf_kvmem_sink_tokens":  6000,
+                "hf_kvmem_cpu_gb":  24,
+                "hf_kv_cache":  "q8",
+                "hf_prefix_cache":  false,
+                "hf_idle_timeout":  0,
+                "hf_mtp_k":  2,
+                "hf_mtp_ngram":  "on",
+                "hf_kvmem_window_tokens":  49152
+            }
+}
