@@ -859,10 +859,8 @@ const SCHEMA = [
     desc: '两种加速方式二选一。MTP：用主模型自带的 nextn 头（模型名带 -mtp）。DFlash2：用独立草稿模型（块扩散并行草稿）。本机实测：无加速 39.2 t/s、DFlash2(n=3) 49.8 t/s（+27%）、MTP2 37.5 t/s。',
     params: [
       { id: 'spec_type', flag: '--spec-type', label: '推测解码模式', type: 'select', default: 'draft-mtp',
-        options: ['none', 'draft-mtp', 'draft-dflash'],
-        help: 'none = 关闭；draft-mtp = 用主模型自带的 MTP 头（需模型名带 -mtp）；draft-dflash = 用独立 DFlash2 草稿模型（需在下面选草稿模型）。' },
-      { id: 'model_draft', flag: '--model-draft', short: '-md', label: 'DFlash2 草稿模型', type: 'model', optional: true,
-        help: '仅 draft-dflash 模式需要。选 Qwen3.8-27B-DFlash2-*.gguf，例如 Q4_K_M（1.09 GB）。留空则 MTP 不需要。' },
+        options: ['none', 'draft-mtp'],
+        help: 'none = 关闭；draft-mtp = 用主模型自带的 MTP 头（模型名带 -mtp）。注：本包内置的 llama.cpp 引擎基于 KVMem v0.18，只实现这两档；v0.18 不再接受 draft-dflash，也不接受独立的 --model-draft。' },
       { id: 'spec_draft_n_max', flag: '--spec-draft-n-max', label: '草稿 token 数', type: 'int', default: 3, min: 1,
         help: '每步预测几个 token。实测：DFlash2 用 3 最佳（49.8 t/s）；用 7 会因接受率降低（37%→19%）而回落到 39.6 t/s。MTP 用 2。' },
       { id: 'spec_kv_dtype', flag: '--spec-kv-dtype', label: '草稿 KV 类型（仅 MTP）', type: 'select', default: 'f16',
@@ -2349,6 +2347,13 @@ function enginePrecheck(cfg) {
   }
   if (cfg.mmproj && !fs.existsSync(String(cfg.mmproj))) {
     return `llama 视觉投影文件不存在：${cfg.mmproj}（不用视觉就把这一栏留空）`;
+  }
+  // 本包内置的 llama.cpp 引擎是 KVMem v0.18：--spec-type 只实现 none / draft-mtp，
+  // 传入 draft-dflash 会被引擎以 "unsupported --spec-type draft-dflash (P7-0: draft-mtp|none)"
+  // 直接拒绝。旧配置里可能还存着这个值，这里提前拦下并说明。
+  if (cfg.spec_type && !['none', 'draft-mtp'].includes(String(cfg.spec_type))) {
+    return `本包引擎只支持「none」或「draft-mtp」两种推测解码模式（收到 "${cfg.spec_type}"）。` +
+           `v0.18 的 llama.cpp 侧没有实现 draft-dflash，请改成 draft-mtp 或 none。`;
   }
   return null;
 }
